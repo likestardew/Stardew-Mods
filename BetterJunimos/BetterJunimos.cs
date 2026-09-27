@@ -265,6 +265,9 @@ namespace BetterJunimos {
             // forget stale scan results and hut warnings from the previous session
             Patches.PatchSearchAroundHut.InvalidateCache();
             Util.ResetMissingHutWarnings();
+            Util.InvalidateHutCache();
+            Utils.CropClaims.Clear();
+            Patches.PatchPathfindDoWork.ClearDecisionTimers();
 
             foreach (var location in Game1.locations) {
                 var toRemove = location.characters.Where(npc => npc is JunimoHarvester).ToList();
@@ -329,6 +332,8 @@ namespace BetterJunimos {
 
             if (e.Added.Any() || e.Removed.Any()) {
                 Patches.PatchSearchAroundHut.InvalidateCache();
+                Util.InvalidateHutCache();
+                Utils.CropClaims.Clear();
             }
         }
 
@@ -336,6 +341,10 @@ namespace BetterJunimos {
         /// <param name="sender">The event sender.</param>
         /// <param name="e">The event arguments.</param>
         private void OnSaveLoaded(object sender, EventArgs e) {
+            // the hut id mapping may reference the previously loaded save
+            Util.InvalidateHutCache();
+            Utils.CropClaims.Clear();
+
             AllowJunimoHutPurchasing();
 
             // make sure crop harvesting is on for everyone
@@ -467,6 +476,12 @@ namespace BetterJunimos {
                 val => Config.JunimoImprovements.WorkRidiculouslyFast = val,
                 "cfg.work-ridiculously-fast",
                 "cfg.work-ridiculously-fast.tooltip"
+            );
+            AddHostBoolOption(
+                () => Config.JunimoImprovements.UseCropClaims,
+                val => Config.JunimoImprovements.UseCropClaims = val,
+                "cfg.crop-claims",
+                "cfg.crop-claims.tooltip"
             );
 
             AddHostBoolOption(

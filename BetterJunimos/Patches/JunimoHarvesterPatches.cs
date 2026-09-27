@@ -4,6 +4,7 @@ using StardewValley.Characters;
 using HarmonyLib;
 using BetterJunimos.Utils;
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using Netcode;
 using BetterJunimos.Abilities;
@@ -21,6 +22,15 @@ namespace BetterJunimos.Patches {
     public class PatchFindingCropEnd {
         public static bool Prefix(JunimoHarvester __instance, ref PathNode currentNode, ref NetGuid ___netHome, ref bool __result) {
             __result = Util.Abilities.IsActionable(__instance.currentLocation, new Vector2(currentNode.x, currentNode.y), ___netHome.Value);
+
+            // claim filter: another junimo is already heading for this tile — treat it
+            // as taken so this junimo targets the next-nearest work instead of piling
+            // onto the same crop. Claims only exist on the master game (and can be
+            // suspended for the unfiltered "shadow" search), so this is a no-op
+            // for farmhands and when the option is off.
+            if (__result && BetterJunimos.Config.JunimoImprovements.UseCropClaims && !CropClaims.SuppressFilter && Context.IsMainPlayer) {
+                __result = !CropClaims.IsClaimedByOther(__instance.currentLocation, new Point(currentNode.x, currentNode.y), __instance);
+            }
 
             return false;
         }
@@ -65,7 +75,9 @@ namespace BetterJunimos.Patches {
                         time = Util.Progression.WorkFaster ? 300 : 998;
                 }
             } else {
-                // nothing to do, wait a moment
+                // nothing to do here (the work vanished before we arrived):
+                // free this junimo's claim on the tile, then re-decide
+                if (BetterJunimos.Config.JunimoImprovements.UseCropClaims) CropClaims.ReleaseOwner(__instance);
                 time = Util.Progression.WorkFaster ? 5 : 200;
                 __instance.pokeToHarvest();
             }
@@ -104,7 +116,10 @@ namespace BetterJunimos.Patches {
      * salmonberry, 410 blackberry) never get quality from Botanist.
      */
     public class PatchJunimoHarvesterAddItemToHut {
-        public static void Prefix(Item i) {
+        public static void Prefix(JunimoHarvester __instance, Item i) {
+            // the junimo finished harvesting its claimed tile, free it up
+            CropClaims.ReleaseOwner(__instance);
+
             if (!Game1.player.professions.Contains(16)) return;
             if (i is SObject obj && obj.Category == SObject.GreensCategory && obj.ItemId is not ("815" or "296" or "410") && obj.Quality < 4) {
                 obj.Quality = 4;
@@ -121,8 +136,11 @@ namespace BetterJunimos.Patches {
 
             var radius = Util.CurrentWorkingRadius;
             var retry = 0;
+            // Perf fix (ported from Aufhcegak/BetterJunimosFix): each failed retry runs a
+            // full A* pathfind, and unreachable endpoints (fences, buildings) used to retry
+            // 6 times per junimo per event. Cap at 2 attempts; success path is unchanged.
             do {
-                var endPoint = __instance.currentLocation.IsGreenhouse ? 
+                var endPoint = __instance.currentLocation.IsGreenhouse ?
                     EndPointInGreenhouse(__instance) : EndPointInFarm(hut, radius);
 
                 // BetterJunimos.SMonitor.Log($"PatchPathfindToRandomSpotAroundHut: " +
@@ -134,13 +152,19 @@ namespace BetterJunimos.Patches {
 
                 __instance.controller = new PathFindController(__instance, __instance.currentLocation, endPoint, -1, __instance.reachFirstDestinationFromHut, 100);
                 retry++;
-            } while (retry <= 5 && __instance.controller?.pathToEndPoint == null);
+            } while (retry <= 1 && __instance.controller?.pathToEndPoint == null);
         }
 
         private static Point EndPointInGreenhouse(JunimoHarvester jh) {
             var gw = jh.currentLocation.map.Layers[0].LayerWidth;
             var gh = jh.currentLocation.map.Layers[0].LayerHeight;
-            return new Vector2(gw / 2 + Game1.random.Next(-(gw / 2 + 2), gh / 2 - 2), gh / 2 + Game1.random.Next(-(gw / 2 + 2), gh / 2 - 2)).ToPoint();
+            // Bug fix (ported from Aufhcegak/BetterJunimosFix): the original swapped the
+            // width/height bounds (`Next(-(gw / 2 + 2), gh / 2 - 2)` for both axes), which
+            // throws ArgumentOutOfRangeException on non-standard greenhouse sizes. Use a
+            // symmetric per-axis range that always lands inside the walls.
+            var x = gw / 2 + Game1.random.Next(-(gw / 2 - 2), gw / 2 - 2);
+            var y = gh / 2 + Game1.random.Next(-(gh / 2 - 2), gh / 2 - 2);
+            return new Point(x, y);
         }
 
         private static Point EndPointInFarm(JunimoHut hut, int radius) {
@@ -162,10 +186,22 @@ namespace BetterJunimos.Patches {
         }
     }
 
-    // pathfindToNewCrop - completely replace 
+    // pathfindToNewCrop - completely replace
     // Remove the max distance boundary
     [HarmonyPriority(Priority.Low)]
     public class PatchPathfindDoWork {
+        // decision rate cap: ~0.33s between decisions after a successful search,
+        // ~0.66s after a failed one (vanilla: ~0.7 decisions per frame ≈ 42x/s per
+        // junimo, each an A* — see the comment at the top of Prefix)
+        private const int DecisionIntervalTicks = 20;
+        private const int FailedDecisionBackoffTicks = 40;
+        private static readonly Dictionary<JunimoHarvester, int> NextDecisionTick = new();
+
+        internal static void ClearDecisionTimers() {
+            NextDecisionTick.Clear();
+        }
+
+
         public static bool Prefix(JunimoHarvester __instance, ref NetEvent1Field<int, NetInt> ___netAnimationEvent) {
             if (!Context.IsMainPlayer) return true;
             var hut = Util.GetHutFromId(__instance.HomeId);
@@ -199,19 +235,40 @@ namespace BetterJunimos.Patches {
                     // go on strike
                     ___netAnimationEvent.Fire(7);
                 }
-            } else if (hut.noHarvest.Value || (Game1.random.NextDouble() < 0.035 && !BetterJunimos.Config.JunimoImprovements.WorkRidiculouslyFast)) {
-                // Hut has nothing to harvest
-                // TODO: fix for greenhouse
-
-                // BetterJunimos.SMonitor.Log($"PatchPathfindDoWork: {__instance.whichJunimoFromThisHut} hut noHarvest {hut.noHarvest.Value}", LogLevel.Debug);
-                // if (__instance.currentLocation.IsGreenhouse)
-                // {
-                //     BetterJunimos.SMonitor.Log($"PatchPathfindDoWork v2, Is greenhouse but {hut.noHarvest.Value}", LogLevel.Debug);
-
-                // }
-                __instance.pathfindToRandomSpotAroundHut();
             } else {
-                // walk to work?
+                // ---- decision rate cap ----
+                // Vanilla re-decides ~70%/frame (≈42x/s) per junimo while harvestTimer
+                // <= 0 — every attempt is a fresh A*, and mid-walk attempts discard the
+                // path that was just started. With many junimos this is the single
+                // biggest frame-cost driver in the whole mod. Cap decisions per junimo;
+                // in between, a walking junimo simply keeps its current path.
+                var now = Game1.ticks;
+                if (NextDecisionTick.TryGetValue(__instance, out var nextAllowed) && now < nextAllowed) {
+                    return false; // keep the current path / stand still a moment
+                }
+
+                if (hut.noHarvest.Value || (Game1.random.NextDouble() < 0.035 && !BetterJunimos.Config.JunimoImprovements.WorkRidiculouslyFast)) {
+                    // occasional random stroll
+                    NextDecisionTick[__instance] = now + DecisionIntervalTicks;
+                    __instance.pathfindToRandomSpotAroundHut();
+                    return false;
+                }
+
+                // ---- scan gate ----
+                // The hut work scan is cached for 60 ticks; consult it before spending
+                // two full-budget A* searches. Scan false => no actionable tile inside
+                // the radius box, and endpoints outside the box are discarded anyway,
+                // so the searches below could never succeed.
+                var hasWork = hut.areThereMatureCropsWithinRadius();
+                if (!hasWork) {
+                    NextDecisionTick[__instance] = now + DecisionIntervalTicks;
+                    VanillaFallbackRoll(__instance, ___netAnimationEvent, hut, tryLkc: false);
+                    return false;
+                }
+
+                // walk to work? With crop claims on, the end check (PatchFindingCropEnd)
+                // ignores tiles another junimo has claimed, so junimos leaving the hut
+                // together pick different targets instead of converging on one crop.
                 __instance.controller = new PathFindController(__instance, __instance.currentLocation, __instance.foundCropEndFunction, -1, __instance.reachFirstDestinationFromHut,
                     100, Point.Zero);
 
@@ -220,35 +277,69 @@ namespace BetterJunimos.Patches {
                     __instance.currentLocation.NameOrUniqueName == hut.GetParentLocation().NameOrUniqueName && (
                         Math.Abs(__instance.controller.pathToEndPoint.Last().X - hut.tileX.Value - 1) > radius || Math.Abs(__instance.controller.pathToEndPoint.Last().Y - hut.tileY.Value - 1) > radius);
 
+                if (BetterJunimos.Config.JunimoImprovements.UseCropClaims && __instance.controller.pathToEndPoint is null) {
+                    // everything actionable nearby is claimed by other junimos (crowded):
+                    // rerun the search unfiltered so crowding shadows exactly like vanilla
+                    // instead of degrading, before falling any further back
+                    CropClaims.SuppressFilter = true;
+                    __instance.controller = new PathFindController(__instance, __instance.currentLocation, __instance.foundCropEndFunction, -1, __instance.reachFirstDestinationFromHut,
+                        100, Point.Zero);
+                    CropClaims.SuppressFilter = false;
+
+                    outsideRadius = __instance.controller.pathToEndPoint is not null && hut.tileX is not null && hut.tileY is not null && __instance.currentLocation is not null &&
+                        __instance.currentLocation.NameOrUniqueName == hut.GetParentLocation().NameOrUniqueName && (
+                            Math.Abs(__instance.controller.pathToEndPoint.Last().X - hut.tileX.Value - 1) > radius || Math.Abs(__instance.controller.pathToEndPoint.Last().Y - hut.tileY.Value - 1) > radius);
+                }
+
                 if (__instance.controller.pathToEndPoint != null && !outsideRadius) {
+                    NextDecisionTick[__instance] = now + DecisionIntervalTicks;
+
                     // Junimo has somewhere to be, let it happen
+                    if (BetterJunimos.Config.JunimoImprovements.UseCropClaims &&
+                        !CropClaims.IsClaimedByOther(__instance.currentLocation, __instance.controller.pathToEndPoint.Last(), __instance)) {
+                        // claim the endpoint so later decisions by other junimos skip it
+                        // (guaranteed to succeed: the filtered search already skipped claims)
+                        CropClaims.TryClaim(__instance.currentLocation, __instance.controller.pathToEndPoint.Last(), __instance);
+                    }
+
                     ___netAnimationEvent.Fire(0);
                 } else {
-                    // Junimo has no path, or path endpoint is outside the hut radius
-                    Util.Abilities.lastKnownCropLocations.TryGetValue((hut, __instance.currentLocation), out var lkc);
-                    if (Game1.random.NextDouble() < 0.5 && !lkc.Equals(Point.Zero)) {
-                        // hut has some work to do, send Junimo there
-                        __instance.controller = new PathFindController(__instance, __instance.currentLocation, lkc, -1, __instance.reachFirstDestinationFromHut, 100);
-                    } else if (Game1.random.NextDouble() < 0.25) {
-                        // unlucky, send Junimo home
-                        ___netAnimationEvent.Fire(0);
+                    // search failed: release any stale claim and back off longer before
+                    // the next attempt (fenced-off/empty areas are where the old code
+                    // burned 2-3 full-budget A* every frame)
+                    NextDecisionTick[__instance] = now + FailedDecisionBackoffTicks;
+                    if (BetterJunimos.Config.JunimoImprovements.UseCropClaims) CropClaims.ReleaseOwner(__instance);
 
-                        if (__instance.currentLocation is Farm) {
-                            __instance.returnToJunimoHut(__instance.currentLocation);
-                        } else if (__instance.currentLocation.IsGreenhouse) {
-                            returnToGreenhouseDoor(__instance, __instance.currentLocation);
-                        } else {
-                            // can't walk back to the hut from here, just despawn
-                            __instance.junimoReachedHut(__instance, __instance.currentLocation);
-                        }
-                    } else {
-                        // move Junimo randomly
-                        __instance.pathfindToRandomSpotAroundHut();
-                    }
+                    // Junimo has no path, or path endpoint is outside the hut radius
+                    VanillaFallbackRoll(__instance, ___netAnimationEvent, hut, tryLkc: true);
                 }
             }
 
             return false;
+        }
+
+        // the vanilla fallback tail: 50% to the last known work tile, 25% home, else wander
+        private static void VanillaFallbackRoll(JunimoHarvester __instance, NetEvent1Field<int, NetInt> ___netAnimationEvent, JunimoHut hut, bool tryLkc) {
+            Util.Abilities.lastKnownCropLocations.TryGetValue((hut, __instance.currentLocation), out var lkc);
+            if (tryLkc && Game1.random.NextDouble() < 0.5 && !lkc.Equals(Point.Zero)) {
+                // hut has some work to do, send Junimo there
+                __instance.controller = new PathFindController(__instance, __instance.currentLocation, lkc, -1, __instance.reachFirstDestinationFromHut, 100);
+            } else if (Game1.random.NextDouble() < 0.25) {
+                // unlucky, send Junimo home
+                ___netAnimationEvent.Fire(0);
+
+                if (__instance.currentLocation is Farm) {
+                    __instance.returnToJunimoHut(__instance.currentLocation);
+                } else if (__instance.currentLocation.IsGreenhouse) {
+                    returnToGreenhouseDoor(__instance, __instance.currentLocation);
+                } else {
+                    // can't walk back to the hut from here, just despawn
+                    __instance.junimoReachedHut(__instance, __instance.currentLocation);
+                }
+            } else {
+                // move Junimo randomly
+                __instance.pathfindToRandomSpotAroundHut();
+            }
         }
 
         private static void returnToGreenhouseDoor(JunimoHarvester junimo, GameLocation location) {
@@ -288,7 +379,11 @@ namespace BetterJunimos.Patches {
     //public void pokeToHarvest()
     public class PatchPokeToHarvest {
         public static void Postfix(JunimoHarvester __instance, bool ___destroy) {
-            if (___destroy) return;
+            if (___destroy) {
+                // despawning: don't hold a work tile hostage
+                CropClaims.ReleaseOwner(__instance);
+                return;
+            }
             if (__instance.controller != null) return;
             if (!BetterJunimos.Config.JunimoImprovements.WorkRidiculouslyFast) return;
             __instance.pathfindToNewCrop();

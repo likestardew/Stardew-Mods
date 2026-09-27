@@ -50,6 +50,8 @@
   "cfg.work-faster.tooltip": "(does not apply to crop harvesting)",
   "cfg.work-ridiculously-fast": "Work Ridiculously Fast",
   "cfg.work-ridiculously-fast.tooltip": "(does not apply to crop harvesting)",
+  "cfg.crop-claims": "Crop Claiming",
+  "cfg.crop-claims.tooltip": "Junimos claim unclaimed work tiles before setting out, so they stop converging on the same crop. Disable to restore the old behavior.",
   "cfg.avoid-harvesting-flowers": "Avoid Harvesting Flowers",
   "cfg.avoid-harvesting-giant-crops": "Avoid Harvesting Giant Crops",
   "cfg.avoid-harvesting-giant-crops.tooltip": "Leave cauliflower, melon, pumpkin unharvested, so there's more chance of getting giant crops",

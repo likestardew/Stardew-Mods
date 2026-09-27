@@ -47,6 +47,8 @@
   "cfg.work-faster.tooltip": "(收获作物时不生效)",
   "cfg.work-ridiculously-fast": "工作效率十分快",
   "cfg.work-ridiculously-fast.tooltip": "(收获作物时不生效)",
+  "cfg.crop-claims": "作物认领（防扎堆）",
+  "cfg.crop-claims.tooltip": "祝尼魔出发前各自认领没被认领的活计格子，避免多只挤同一个作物。关闭后恢复旧版行为。",
   "cfg.avoid-harvesting-flowers": "不收获花",
   "cfg.avoid-harvesting-giant-crops": "不收获巨大作物",
   "cfg.avoid-harvesting-giant-crops.tooltip": "不收获花椰菜，南瓜，甜瓜，以此增加巨大作物产生几率",

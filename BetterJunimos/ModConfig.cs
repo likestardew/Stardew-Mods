@@ -25,6 +25,7 @@ namespace BetterJunimos {
             public bool CanWorkInGreenhouse { get; set; } = true;
             public bool WorkFaster { get; set; } = true;
             public bool WorkRidiculouslyFast { get; set; }
+            public bool UseCropClaims { get; set; } = true;
             public bool AvoidHarvestingFlowers { get; set; } = true;
             public bool AvoidHarvestingGiants { get; set; } = true;
             public bool HarvestEverythingOn28th { get; set; } = true;

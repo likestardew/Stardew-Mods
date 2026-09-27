@@ -54,24 +54,56 @@ namespace BetterJunimos.Utils {
             return GetAllFarms().SelectMany(farm => farm.buildings.OfType<JunimoHut>().ToList()).ToList();
         }
 
+        // Hut <-> id lookups are called many times per frame from JunimoHarvester
+        // update/pathfinding, and each uncached call scans every location x building.
+        // Cache the mapping for the current day (ported from Aufhcegak/BetterJunimosFix);
+        // lookups that miss (newly built huts) fall back to a scan and backfill the cache.
+        private static readonly Dictionary<Guid, JunimoHut> HutByIdCache = new();
+        private static readonly Dictionary<JunimoHut, Guid> HutIdCache = new();
+        private static int HutCacheDay = -1;
+
+        private static void EnsureHutCacheFresh() {
+            int totalDays;
+            try { totalDays = Game1.Date.TotalDays; } catch { return; }
+            if (HutCacheDay == totalDays) return;
+            InvalidateHutCache();
+            HutCacheDay = totalDays;
+        }
+
+        internal static void InvalidateHutCache() {
+            HutByIdCache.Clear();
+            HutIdCache.Clear();
+            HutCacheDay = -1;
+        }
+
         public static Guid GetHutIdFromHut(JunimoHut hut) {
             if (hut is null) return Guid.Empty;
+            EnsureHutCacheFresh();
+            if (HutIdCache.TryGetValue(hut, out var cached)) return cached;
             foreach (var farm in GetAllFarms()) {
                 var id = farm.buildings.GuidOf(hut);
-                if (id != Guid.Empty) return id;
+                if (id == Guid.Empty) continue;
+                HutIdCache[hut] = id;
+                HutByIdCache[id] = hut;
+                return id;
             }
 
             return Guid.Empty;
         }
 
         public static JunimoHut GetHutFromId(Guid id) {
+            if (id == Guid.Empty) return null;
+            EnsureHutCacheFresh();
+            if (HutByIdCache.TryGetValue(id, out var hut)) return hut;
             foreach (var farm in GetAllFarms()) {
-                if (farm.buildings.TryGetValue(id, out var hut)) {
-                    return hut as JunimoHut;
+                if (farm.buildings.TryGetValue(id, out var building) && building is JunimoHut junimoHut) {
+                    HutByIdCache[id] = junimoHut;
+                    HutIdCache[junimoHut] = id;
+                    return junimoHut;
                 }
             }
 
-            if (id != Guid.Empty && MissingHutWarnings.Add(id)) {
+            if (MissingHutWarnings.Add(id)) {
                 BetterJunimos.SMonitor.Log($"Could not find hut with id {id}", LogLevel.Warn);
             }
             return null;

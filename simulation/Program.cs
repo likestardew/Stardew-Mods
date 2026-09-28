@@ -53,7 +53,7 @@ internal static class Cfg {
     public const int RUNS = 30;
     public static readonly int[] Radii = { 8, 14, 20 };
     public static readonly int[] JunimoCounts = { 1, 2, 3, 4, 6, 8 };
-    public static readonly string[] Algos = { "legacy", "claims_v4b", "v4b_gate_backoff" };
+    public static readonly string[] Algos = { "legacy", "cap_only", "claims_v4b", "v4b_gate_backoff" };
     // crop density: fraction of free tiles in the working box that hold a crop
     // 0.75 ≈ circular planting inside the box, 1.00 ≈ fully planted square
     public static readonly double[] Densities = { 0.10, 0.75, 1.00 };
@@ -585,6 +585,7 @@ internal sealed class Simulation {
             case "v4b_shipped": DecideV4b(j, tick, gate: false, backoff: false); break;
             case "v4b_gate": DecideV4b(j, tick, gate: true, backoff: false); break;
             case "v4b_gate_backoff": DecideV4b(j, tick, gate: true, backoff: true); break;
+            case "cap_only": DecideCapOnly(j, tick); break;
         }
     }
 
@@ -697,6 +698,51 @@ internal sealed class Simulation {
         // search failed: free any stale claim, back off before the next attempt
         ReleaseOwnClaim(j);
         if (backoff) _backoff[j] = tick + Cfg.BACKOFF_TICKS;
+
+        var roll = _rnd.NextDouble();
+        if (roll < 0.5 && _lkc >= 0 && _crops.Contains(_lkc)) {
+            var p = AStarTo(j.Pos, _lkc, Cfg.EXP_LIMIT_LEGACY);
+            if (p != null) { StartWalk(j, p, tick); return; }
+            roll = _rnd.NextDouble();
+        } else {
+            roll = _rnd.NextDouble();
+        }
+
+        if (roll < 0.25) {
+            _respawns++;
+            j.State = Junimo.St.WaitingRespawn;
+            j.NextEventTick = tick + Cfg.SPAWN_STAGGER_TICKS;
+        } else {
+            Wander(j, tick);
+        }
+    }
+
+    // cap_only: the decision rate cap + scan gate WITHOUT the claim filter —
+    // vanilla target choice, throttled. Isolates how much of the throughput gain
+    // comes from the despawn-spiral fix (cap) vs the anti-clump filter (claims).
+    private void DecideCapOnly(Junimo j, long tick) {
+        if (tick - _gateScanTick >= Cfg.SCAN_COOLDOWN_TICKS) {
+            ScanWorkTiles(cap: 1);
+            _cachedHasWork = _workTiles.Count > 0;
+            _gateScanTick = tick;
+        }
+        if (!_cachedHasWork) { VanillaTail(j, tick, allowLkc: false); return; }
+
+        if (_backoff.TryGetValue(j, out var until) && tick < until) {
+            j.State = Junimo.St.WaitingDecision;
+            j.NextEventTick = tick + Cfg.DECISION_RETRY_TICKS;
+            return;
+        }
+
+        var path = AStarNearest(j.Pos, Cfg.EXP_LIMIT_LEGACY);
+        if (path != null) {
+            _backoff[j] = tick + Cfg.SUCCESS_CAP_TICKS;
+            StartWalk(j, path, tick);
+            return;
+        }
+
+        // search failed: back off longer before the next attempt
+        _backoff[j] = tick + Cfg.BACKOFF_TICKS;
 
         var roll = _rnd.NextDouble();
         if (roll < 0.5 && _lkc >= 0 && _crops.Contains(_lkc)) {

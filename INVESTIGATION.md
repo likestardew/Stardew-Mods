@@ -197,13 +197,15 @@ keeps the single daily plan out of the shrunken unpaid radius).
 
 **Environment (stated every time):** Stardew Valley 1.6.15 + SMAPI, single-player host, **~200
 mods** installed, hut radius 14, `MaxJunimos = 6` per hut, **WorkFaster = false**,
-**WorkRidiculouslyFast = false**. Baseline for comparison = the `perf/junimo-pathfinding` claims
-build (the withdrawn #114 code, which itself measured ≈ vanilla on clear time, §5).
+**WorkRidiculouslyFast = false**. Baseline for comparison = **official vanilla 3.2.0** (the
+unpatched official DLL, timed by the same user in the same environment: left field 10h/11.5h,
+right field 11h/11h — the "Vanilla" column of the §5 table). The claims build is *not* the
+baseline here, and no claims-relative percentage was measured.
 
-| Scenario | Crops | Clear time vs claims-baseline | Notes |
+| Scenario | Crops | Clear time vs official vanilla 3.2.0 | Notes |
 |---|---|---|---|
-| Left field, 1 hut | 576 | **~70-80%** of baseline time | |
-| Right field, 2 huts | 1152 total (~150-tile box overlap) | **~65-75%** of baseline time | first time the two-hut mixed scenario came out *relatively better* than the single-hut one |
+| Left field, 1 hut | 576 | **~70-80%** of vanilla time (≈20-30% faster) | |
+| Right field, 2 huts | 1152 total (~150-tile box overlap) | **~65-75%** of vanilla time (≈25-35% faster) | first time the two-hut mixed scenario came out *relatively better* than the single-hut one |
 
 Also observed: FPS slightly up; **all six junimos working** (six segments cut, six claimed);
 continuous serpentine paths with no backtracking; no clumping; endgame responses normal.

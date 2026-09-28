@@ -5,6 +5,20 @@ namespace BetterJunimos {
     internal class ModConfig {
         public Dictionary<string, bool> JunimoAbilities { get; set; } = new();
 
+        // ---- two-mode work assignment scheduling (candidate build assign2-plain) ----
+        // Master switch: once per day each hut inventories its box, builds one serpentine
+        // walk and cuts it into equal-time contiguous slices (one per junimo); after the
+        // mass is eaten, junimos switch to a rate-limited endgame mode for stragglers.
+        // Turn off to restore the shipped throttle/gate/claim behaviour exactly.
+        public bool WorkAssignment { get; set; } = true;
+
+        // Hard rate limit (seconds per hut) for endgame box scans: on-demand only (some
+        // junimo has nothing to do / the spawn gate asks), and never more often than this.
+        public int EndgameScanIntervalSeconds { get; set; } = 15;
+
+        // Log scan cost (tile reads, elapsed ticks, result counts) to the SMAPI log.
+        public bool DebugLog { get; set; } = false;
+
         public HutSettings JunimoHuts { get; set; } = new();
 
         internal class HutSettings {

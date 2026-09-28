@@ -7,6 +7,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using BetterJunimos.Patches;
+using BetterJunimos.Assign;
 using StardewValley;
 using StardewValley.Characters;
 using StardewValley.Menus;
@@ -33,6 +34,18 @@ namespace BetterJunimos {
             Config = helper.ReadConfig<ModConfig>();
             SaveConfig();
 
+            // ---- candidate build banner (anti-confusion) ----
+            // This banner makes the loaded build unambiguous in the SMAPI log.
+            var infoVer = GetType().Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion ?? "?";
+            SMonitor.Log($"[BJ-candidate] build={WorkAssigner.BuildId} (InformationalVersion={infoVer})", LogLevel.Info);
+            SMonitor.Log(
+                $"[BJ-candidate] mechanism: WorkAssignment={Config.WorkAssignment} — 两模式：批量蛇形等时 + 末端降频启发式 " +
+                "(bulk: once-a-day serpentine plan cut into equal-time contiguous slices; " +
+                $"endgame: rate-limited ({Config.EndgameScanIntervalSeconds}s/hut) nearest-target for stragglers); " +
+                "main-thread direct pathfinding (budget 10000, no async layer); " +
+                "v2.1: equal-time cut fix (cumulative thresholds) + birth stroll guarantee + conservative pathfail blacklist",
+                LogLevel.Info);
+
             Util.Reflection = helper.Reflection;
 
             Util.Abilities = new JunimoAbilities(Config.JunimoAbilities, Monitor);
@@ -48,9 +61,13 @@ namespace BetterJunimos {
             helper.Events.Display.MenuChanged += OnMenuChanged;
             helper.Events.GameLoop.GameLaunched += OnGameLaunched;
             helper.Events.GameLoop.DayStarted += OnDayStarted;
+            helper.Events.GameLoop.DayEnding += OnDayEnding;
             helper.Events.GameLoop.SaveLoaded += OnSaveLoaded;
             helper.Events.GameLoop.Saving += OnSaving;
+            helper.Events.GameLoop.ReturnedToTitle += OnReturnedToTitle;
             helper.Events.World.BuildingListChanged += OnBuildingListChanged;
+
+            helper.Events.GameLoop.UpdateTicking += WorkAssigner.OnUpdateTicking;
 
             DoHarmonyRegistration();
 
@@ -234,6 +251,17 @@ namespace BetterJunimos {
             Patches.PatchSearchAroundHut.InvalidateCache();
         }
 
+        /// <summary>Raised before the day changes, while the old day is still loaded.</summary>
+        private void OnDayEnding(object sender, DayEndingEventArgs e) {
+            // drop all routes/registrations/plans for the old day
+            WorkAssigner.OnWorldInvalidated();
+        }
+
+        /// <summary>Raised after the player returns to the title screen.</summary>
+        private void OnReturnedToTitle(object sender, ReturnedToTitleEventArgs e) {
+            WorkAssigner.OnWorldInvalidated();
+        }
+
         /// <summary>Raised after the game begins a new day (including when the player loads a save).</summary>
         /// <param name="sender">The event sender.</param>
         /// <param name="e">The event arguments.</param>
@@ -268,6 +296,8 @@ namespace BetterJunimos {
             Util.InvalidateHutCache();
             Utils.CropClaims.Clear();
             Patches.PatchPathfindDoWork.ClearDecisionTimers();
+            // assignment mode: clear routes/registry and rebuild scan phases (sim-assign §6)
+            WorkAssigner.OnDayStarted();
 
             foreach (var location in Game1.locations) {
                 var toRemove = location.characters.Where(npc => npc is JunimoHarvester).ToList();
@@ -334,6 +364,8 @@ namespace BetterJunimos {
                 Patches.PatchSearchAroundHut.InvalidateCache();
                 Util.InvalidateHutCache();
                 Utils.CropClaims.Clear();
+                // assignment mode: hut set changed → release routes and re-stagger phases
+                WorkAssigner.OnWorldInvalidated();
             }
         }
 
@@ -344,6 +376,8 @@ namespace BetterJunimos {
             // the hut id mapping may reference the previously loaded save
             Util.InvalidateHutCache();
             Utils.CropClaims.Clear();
+            // assignment mode: the previous world's routes are meaningless
+            WorkAssigner.OnWorldInvalidated();
 
             AllowJunimoHutPurchasing();
 
@@ -439,11 +473,29 @@ namespace BetterJunimos {
                 () => Helper.Translation.Get("cfg.improvements"),
                 () => ""
             );
-            AddBoolOption(
+            AddHostBoolOption(
                 () => Config.Progression.Enabled,
                 val => Config.Progression.Enabled = val,
                 "cfg.skills-progression",
                 "cfg.skills-progression.tooltip");
+            AddHostBoolOption(
+                () => Config.WorkAssignment,
+                val => Config.WorkAssignment = val,
+                "cfg.work-assignment",
+                "cfg.work-assignment.tooltip"
+            );
+            AddHostNumberOption(
+                () => Config.EndgameScanIntervalSeconds,
+                val => Config.EndgameScanIntervalSeconds = val,
+                "cfg.endgame-scan-interval",
+                5, 120
+            );
+            AddHostBoolOption(
+                () => Config.DebugLog,
+                val => Config.DebugLog = val,
+                "cfg.debug-log",
+                "cfg.debug-log.tooltip"
+            );
             AddHostBoolOption(
                 () => Config.JunimoImprovements.CanWorkInRain,
                 val => Config.JunimoImprovements.CanWorkInRain = val,

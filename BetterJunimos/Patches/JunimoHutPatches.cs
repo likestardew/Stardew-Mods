@@ -1,6 +1,7 @@
 using System;
 using System.Linq;
 using System.Collections.Generic;
+using BetterJunimos.Assign;
 using BetterJunimos.Utils;
 using HarmonyLib;
 using Microsoft.Xna.Framework;
@@ -218,8 +219,11 @@ namespace BetterJunimos.Patches {
             // Don't spawn during a farm event on the farm (vanilla behaviour)
             if (hut.GetParentLocation().NameOrUniqueName == "Farm" && Game1.farmEvent != null) return;
 
-            // Nothing to do
-            if (!hut.areThereMatureCropsWithinRadius()) return;
+            // Nothing to do. Assignment mode (WorkAssignment=true) consults the scan
+            // pool/route registry instead of the cached box scan — zero tile reads
+            // (sim-assign DESIGN §4); a missing snapshot triggers one inline scan, still
+            // throttled by the spawn pacing above.
+            if (WorkAssigner.Active ? !WorkAssigner.HasWorkFor(hut) : !hut.areThereMatureCropsWithinRadius()) return;
 
             Util.SpawnJunimoAtHut(hut);
             _lastSpawnTick[hut] = Game1.ticks;

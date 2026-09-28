@@ -8,6 +8,7 @@ using System.Collections.Generic;
 using System.Linq;
 using Netcode;
 using BetterJunimos.Abilities;
+using BetterJunimos.Assign;
 using StardewModdingAPI;
 using StardewValley.Buildings;
 using StardewValley.Pathfinding;
@@ -153,6 +154,30 @@ namespace BetterJunimos.Patches {
                 __instance.controller = new PathFindController(__instance, __instance.currentLocation, endPoint, -1, __instance.reachFirstDestinationFromHut, 100);
                 retry++;
             } while (retry <= 1 && __instance.controller?.pathToEndPoint == null);
+
+            // v2.1 birth guarantee: the JunimoHarvester constructor destroys the junimo when
+            // this method yields no path (junimo.cs `destroy = true`), and hut numbers ≥ 3
+            // have no anchor branch — for them this IS the birth pathfind. Two full-radius
+            // attempts can both exceed the limit-100 budget when the endpoint lands in a
+            // fenced/unreachable plot, so degrade to NEARBY endpoints (≤3 tiles), whose
+            // paths resolve within a handful of dequeues. Birth destroy becomes unreachable.
+            if (__instance.controller?.pathToEndPoint == null) {
+                for (var attempt = 0; attempt < 4 && __instance.controller?.pathToEndPoint == null; attempt++) {
+                    var endPoint = __instance.currentLocation.IsGreenhouse ?
+                        EndPointNearGreenhouseCenter(__instance) : EndPointNearHut(hut);
+                    __instance.controller = new PathFindController(__instance, __instance.currentLocation, endPoint, -1, __instance.reachFirstDestinationFromHut, 100);
+                }
+
+                if (__instance.controller?.pathToEndPoint == null) {
+                    if (BetterJunimos.Config.DebugLog) {
+                        BetterJunimos.SMonitor.Log($"[BJ-assign2] birth stroll: all attempts failed hut@({hut.tileX.Value},{hut.tileY.Value}) " +
+                                                   $"j#{__instance.whichJunimoFromThisHut} — vanilla will mark destroy", LogLevel.Debug);
+                    }
+                } else if (BetterJunimos.Config.DebugLog) {
+                    BetterJunimos.SMonitor.Log($"[BJ-assign2] birth stroll: nearby fallback used hut@({hut.tileX.Value},{hut.tileY.Value}) " +
+                                               $"j#{__instance.whichJunimoFromThisHut} (full-radius attempts unreachable)", LogLevel.Debug);
+                }
+            }
         }
 
         private static Point EndPointInGreenhouse(JunimoHarvester jh) {
@@ -167,8 +192,22 @@ namespace BetterJunimos.Patches {
             return new Point(x, y);
         }
 
+        private static Point EndPointNearGreenhouseCenter(JunimoHarvester jh) {
+            var gw = jh.currentLocation.map.Layers[0].LayerWidth;
+            var gh = jh.currentLocation.map.Layers[0].LayerHeight;
+            var x = gw / 2 + Game1.random.Next(-3, 4);
+            var y = gh / 2 + Game1.random.Next(-3, 4);
+            return new Point(x, y);
+        }
+
         private static Point EndPointInFarm(JunimoHut hut, int radius) {
             return Utility.Vector2ToPoint(new Vector2(hut.tileX.Value + 1 + Game1.random.Next(-radius, radius + 1), hut.tileY.Value + 1 + Game1.random.Next(-radius, radius + 1)));
+        }
+
+        // v2.1: short-range box centred on the spawn tile (hut door front, (tileX+1, tileY+2))
+        // — endpoints here are overwhelmingly passable and the paths are a few tiles long.
+        private static Point EndPointNearHut(JunimoHut hut) {
+            return new Point(hut.tileX.Value + 1 + Game1.random.Next(-3, 4), hut.tileY.Value + 2 + Game1.random.Next(-3, 4));
         }
     }
 
@@ -238,7 +277,33 @@ namespace BetterJunimos.Patches {
                     // go on strike
                     ___netAnimationEvent.Fire(7);
                 }
-            } else {
+            }
+
+            // ---- assignment mode (WorkAssignment=true, this hut's own location) ----
+            // assign2 DESIGN-v2: there are no periodic scans — every trigger (10-minute
+            // poke, harvest-timer expiry, arrival with nothing to do, the p=0.002 idle
+            // roll, the WorkRidiculouslyFast catch-up) funnels into JunimoDecision and
+            // means exactly one bounded action:
+            //   - already walking → no-op (this is what makes the 430t double-poke free)
+            //   - has a route     → advance: pop the consumed head, A* to the next
+            //                       (unreachable heads are skipped, ≤4 attempts)
+            //   - no route        → WorkSeek: orphan slice → unclaimed slice → wind-down
+            //                       inventory (once) → endgame (shared pool → rate-gated
+            //                       scan → return home)
+            else if (WorkAssigner.Handles(__instance, hut)) {
+                if (__instance.controller != null) return false;
+
+                // keep the shipped wander semantics: hut switched to noHarvest, or the
+                // occasional 3.5% stroll (suppressed by WorkRidiculouslyFast, as shipped)
+                if (hut.noHarvest.Value || (Game1.random.NextDouble() < 0.035 && !BetterJunimos.Config.JunimoImprovements.WorkRidiculouslyFast)) {
+                    __instance.pathfindToRandomSpotAroundHut();
+                    return false;
+                }
+
+                WorkAssigner.JunimoDecision(__instance, hut);
+            }
+
+            else {
                 // ---- decision rate cap ----
                 // Vanilla decisions are event-driven (path arrival, harvest-timer
                 // expiry, the hut's 10-minute poke), so per-junimo cadence is low.
@@ -382,13 +447,35 @@ namespace BetterJunimos.Patches {
     // pokeToHarvest
     //public void pokeToHarvest()
     public class PatchPokeToHarvest {
-        public static void Postfix(JunimoHarvester __instance, bool ___destroy) {
+        public static void Postfix(JunimoHarvester __instance, int ___harvestTimer, bool ___destroy) {
             if (___destroy) {
+                // v2.1 diagnostics: where and why a junimo died (hutTilePassable=false means
+                // the vanilla standing-on-footprint execution fired)
+                if (BetterJunimos.Config.DebugLog && Context.IsMainPlayer) {
+                    var deathHut = Util.GetHutFromId(__instance.HomeId);
+                    var onFootprint = deathHut != null && !deathHut.isTilePassable(__instance.Tile);
+                    BetterJunimos.SMonitor.Log($"[BJ-assign2] destroy j#{__instance.whichJunimoFromThisHut} " +
+                                               $"at={__instance.TilePoint} hut={(deathHut != null ? $"{deathHut.tileX.Value},{deathHut.tileY.Value}" : "null")} " +
+                                               $"standingOnHutFootprint={onFootprint}", LogLevel.Debug);
+                }
                 // despawning: don't hold a work tile hostage
                 CropClaims.ReleaseOwner(__instance);
+                // assignment mode: also free the junimo's route + registry rows (§6)
+                WorkAssigner.ReleaseJunimo(__instance);
                 return;
             }
             if (__instance.controller != null) return;
+            // assignment mode: this call IS the route-advance event (harvest-timer expiry,
+            // arrival-with-nothing, 10-minute poke). Vanilla gates it behind p<0.7 and
+            // WorkRidiculouslyFast behind its postfix; assignment makes it deterministic
+            // because the call is bounded — at most one direct A* (budget 10000), and only
+            // when the junimo actually has work (sim-assign §4). The harvestTimer<=0 gate
+            // mirrors the vanilla body so the 10-minute poke can never yank a junimo off
+            // a crop it is currently harvesting.
+            if (WorkAssigner.Active) {
+                if (___harvestTimer <= 0) __instance.pathfindToNewCrop();
+                return;
+            }
             if (!BetterJunimos.Config.JunimoImprovements.WorkRidiculouslyFast) return;
             __instance.pathfindToNewCrop();
         }

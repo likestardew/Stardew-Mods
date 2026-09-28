@@ -8,6 +8,7 @@ using StardewValley.Buildings;
 using StardewValley.Characters;
 using StardewValley.Menus;
 using StardewValley.Objects;
+using BetterJunimos.Assign;
 using SObject = StardewValley.Object;
 
 namespace BetterJunimos.Utils {
@@ -166,6 +167,11 @@ namespace BetterJunimos.Utils {
             location.characters.Add(junimoHarvester);
             hut.myJunimos.Add(junimoHarvester);
             junimoHarvester.HomeId = Util.GetHutIdFromHut(hut);
+
+            // assignment mode: spawn goes straight to work (sim-assign DESIGN §8 rev 1,
+            // 出生即自补) — cancels the constructor's random stroll and takes the nearest
+            // pooled target; no pooled work → it sleeps until the hut's next scan
+            if (WorkAssigner.Active) WorkAssigner.OnJunimoSpawned(junimoHarvester);
 
             if (Game1.isRaining) {
                 var alpha = Reflection.GetField<float>(junimoHarvester, "alpha");

@@ -4,6 +4,10 @@
     <AssemblyName>BetterJunimos</AssemblyName>
     <RootNamespace>BetterJunimos</RootNamespace>
     <Version>3.2.0</Version>
+    <!-- v2.1 candidate build; -p:InformationalVersion=... still overrides -->
+    <InformationalVersion Condition="'$(InformationalVersion)' == ''">3.2.0-assign2.1-plain</InformationalVersion>
+    <!-- legacy v1 async layer: dormant (assign2 never defines ASYNC_PATHFIND; async was shelved) -->
+    <DefineConstants Condition="'$(ASYNC_PATHFIND)' == 'true'">$(DefineConstants);ASYNC_PATHFIND</DefineConstants>
     <LangVersion>latest</LangVersion>
     <TargetFramework>net6.0</TargetFramework>
     <EnableHarmony>true</EnableHarmony>

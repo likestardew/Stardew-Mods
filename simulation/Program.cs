@@ -49,24 +49,24 @@ internal static class Cfg {
     public const int EXP_LIMIT_LEGACY = 100;
     public const int EXP_LIMIT_CLAIMS = 1000;
     public const int MAX_WORK_TILES = 32;
-    public const int SIM_CAP_TICKS = 600_000;
-    public const int RUNS = 30;
-    public static readonly int[] Radii = { 8, 14, 20 };
-    public static readonly int[] JunimoCounts = { 1, 2, 3, 4, 6, 8 };
-    public static readonly string[] Algos = { "legacy", "cap_only", "claims_v4b", "v4b_gate_backoff" };
+    public const int SIM_CAP_TICKS = 240_000;
+    public const int RUNS = 20;
+    public static readonly int[] Radii = { 14 };
+    public static readonly int[] JunimoCounts = { 2, 4, 6, 8 };
+    public static readonly string[] Algos = { "legacy", "legacy_arrival", "cap_only", "v4b_gate_backoff", "v4b_realfilter" };
     // crop density: fraction of free tiles in the working box that hold a crop
     // 0.75 ≈ circular planting inside the box, 1.00 ≈ fully planted square
-    public static readonly double[] Densities = { 0.10, 0.75, 1.00 };
+    public static readonly double[] Densities = { 0.75, 1.00 };
 
     // ---- CPU/day benchmark (steady-state churn is where the lag lives) ----
     public const int DAY_TICKS = 36000;          // 6:00-20:00 at 430 ticks / 10 game-min
     public const int BACKOFF_TICKS = 40;         // 0.66s decision backoff after a failed search
     public const int SUCCESS_CAP_TICKS = 20;     // 0.33s between decisions after a successful one
-    public const int CPU_RUNS = 10;
+    public const int CPU_RUNS = 5;
     public static readonly int[] WaveTicks = { 2000, 10000, 18000, 26000 };
     public static readonly int[] CpuRadii = { 14 };
     public static readonly int[] CpuJunimos = { 2, 6 };
-    public static readonly string[] CpuAlgos = { "legacy", "v4b_shipped", "v4b_gate", "v4b_gate_backoff" };
+    public static readonly string[] CpuAlgos = { "legacy", "legacy_arrival", "cap_only", "v4b_gate_backoff", "v4b_realfilter" };
     // obstacle rates: open field vs fenced/decorated farm (searches fail -> storm)
     public static readonly double[] CpuObstacles = { 0.05, 0.25 };
 }
@@ -470,7 +470,7 @@ internal sealed class Simulation {
 
     // "nearest actionable tile" like foundCropEndFunction: no heuristic (Dijkstra),
     // endFunction checked on pop, expansion budget = limit
-    private List<int> AStarNearest(int start, int limit, Junimo self = null) {
+    private List<int> AStarNearest(int start, int limit, Junimo self = null, bool skipClaimed = false) {
         var open = new PriorityQueue<int, (long g, long seq)>();
         long seq = 0;
         var gScore = new Dictionary<int, long> { [start] = 0 };
@@ -487,7 +487,9 @@ internal sealed class Simulation {
             if (pops > limit) { AddPops(pops); return null; }
 
             var claimedByOther = self != null && _claims.TryGetValue(cur, out var owner) && !ReferenceEquals(owner, self);
-            if (cur != start && _crops.Contains(cur)) {
+            // real mod (PatchFindingCropEnd): a claimed tile's end check returns false,
+            // so findPath keeps searching for the next-nearest unclaimed crop
+            if (cur != start && _crops.Contains(cur) && !(skipClaimed && claimedByOther)) {
                 AddPops(pops);
                 _lastSearchShadow = claimedByOther;
                 return Reconstruct(cameFrom, cur);
@@ -586,6 +588,8 @@ internal sealed class Simulation {
             case "v4b_gate": DecideV4b(j, tick, gate: true, backoff: false); break;
             case "v4b_gate_backoff": DecideV4b(j, tick, gate: true, backoff: true); break;
             case "cap_only": DecideCapOnly(j, tick); break;
+            case "legacy_arrival": DecideLegacy(j, tick); break;
+            case "v4b_realfilter": DecideV4bRealFilter(j, tick); break;
         }
     }
 
@@ -698,6 +702,69 @@ internal sealed class Simulation {
         // search failed: free any stale claim, back off before the next attempt
         ReleaseOwnClaim(j);
         if (backoff) _backoff[j] = tick + Cfg.BACKOFF_TICKS;
+
+        var roll = _rnd.NextDouble();
+        if (roll < 0.5 && _lkc >= 0 && _crops.Contains(_lkc)) {
+            var p = AStarTo(j.Pos, _lkc, Cfg.EXP_LIMIT_LEGACY);
+            if (p != null) { StartWalk(j, p, tick); return; }
+            roll = _rnd.NextDouble();
+        } else {
+            roll = _rnd.NextDouble();
+        }
+
+        if (roll < 0.25) {
+            _respawns++;
+            j.State = Junimo.St.WaitingRespawn;
+            j.NextEventTick = tick + Cfg.SPAWN_STAGGER_TICKS;
+        } else {
+            Wander(j, tick);
+        }
+    }
+
+    // v4b_gate_backoff with the REAL mod claim-filter semantics: the filtered end
+    // check skips tiles claimed by another junimo and keeps searching; only when no
+    // unclaimed actionable tile exists in the whole budget does the mod re-run the
+    // search unfiltered (a second full A*) and shadow the nearest claimed tile.
+    private void DecideV4bRealFilter(Junimo j, long tick) {
+        if (tick - _gateScanTick >= Cfg.SCAN_COOLDOWN_TICKS) {
+            ScanWorkTiles(cap: 1);
+            _cachedHasWork = _workTiles.Count > 0;
+            _gateScanTick = tick;
+        }
+        if (!_cachedHasWork) { VanillaTail(j, tick, allowLkc: false); return; }
+
+        if (_backoff.TryGetValue(j, out var until) && tick < until) {
+            j.State = Junimo.St.WaitingDecision;
+            j.NextEventTick = tick + Cfg.DECISION_RETRY_TICKS;
+            return;
+        }
+
+        var path = AStarNearest(j.Pos, Cfg.EXP_LIMIT_LEGACY, self: j, skipClaimed: true);
+        var shadow = false;
+        if (path == null) {
+            // crowded: unfiltered shadow re-search, exactly like PatchPathfindDoWork
+            shadow = true;
+            path = AStarNearest(j.Pos, Cfg.EXP_LIMIT_LEGACY, self: null);
+        }
+        if (path != null) {
+            _backoff[j] = tick + Cfg.SUCCESS_CAP_TICKS;
+            if (shadow) {
+                // shadowing a claimed tile: the real mod's TryClaim is skipped
+                // (tile claimed by other) and no ReleaseOwner runs on this path
+                StartWalk(j, path, tick);
+                return;
+            }
+            ReleaseOwnClaim(j);
+            var end = path[^1];
+            _claims[end] = j;
+            _ownerClaim[j] = end;
+            StartWalk(j, path, tick);
+            return;
+        }
+
+        // search failed: free any stale claim, back off before the next attempt
+        ReleaseOwnClaim(j);
+        _backoff[j] = tick + Cfg.BACKOFF_TICKS;
 
         var roll = _rnd.NextDouble();
         if (roll < 0.5 && _lkc >= 0 && _crops.Contains(_lkc)) {

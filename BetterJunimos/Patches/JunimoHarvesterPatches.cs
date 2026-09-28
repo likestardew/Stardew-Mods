@@ -190,9 +190,12 @@ namespace BetterJunimos.Patches {
     // Remove the max distance boundary
     [HarmonyPriority(Priority.Low)]
     public class PatchPathfindDoWork {
-        // decision rate cap: ~0.33s between decisions after a successful search,
-        // ~0.66s after a failed one (vanilla: ~0.7 decisions per frame ≈ 42x/s per
-        // junimo, each an A* — see the comment at the top of Prefix)
+        // decision rate cap: >=0.33s between decisions after a successful search,
+        // >=0.66s after a failed one. Vanilla decisions are event-driven (arrival,
+        // harvest-timer expiry, the hut's 10-minute poke) so this rarely binds in
+        // normal play; its job is to bound redundant re-planning when triggers
+        // coincide (every junimo poked in the same frame) and to back off after
+        // failed searches in fenced-off areas instead of retrying immediately.
         private const int DecisionIntervalTicks = 20;
         private const int FailedDecisionBackoffTicks = 40;
         private static readonly Dictionary<JunimoHarvester, int> NextDecisionTick = new();
@@ -237,11 +240,12 @@ namespace BetterJunimos.Patches {
                 }
             } else {
                 // ---- decision rate cap ----
-                // Vanilla re-decides ~70%/frame (≈42x/s) per junimo while harvestTimer
-                // <= 0 — every attempt is a fresh A*, and mid-walk attempts discard the
-                // path that was just started. With many junimos this is the single
-                // biggest frame-cost driver in the whole mod. Cap decisions per junimo;
-                // in between, a walking junimo simply keeps its current path.
+                // Vanilla decisions are event-driven (path arrival, harvest-timer
+                // expiry, the hut's 10-minute poke), so per-junimo cadence is low.
+                // The cap matters when triggers coincide: the 10-minute poke re-plans
+                // every junimo in the same frame, and a failed search followed by
+                // immediate re-pokes (fenced-in areas) would otherwise re-run full
+                // A* back to back. In between, a walking junimo keeps its path.
                 var now = Game1.ticks;
                 if (NextDecisionTick.TryGetValue(__instance, out var nextAllowed) && now < nextAllowed) {
                     return false; // keep the current path / stand still a moment

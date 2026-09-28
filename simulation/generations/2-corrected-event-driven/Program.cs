@@ -1,0 +1,1112 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace JunimoSim;
+
+/*
+ * Offline simulation of JunimoHarvester work-finding algorithms.
+ *
+ * Fidelity notes (from decompiled game + mod sources):
+ *  - grid farm 80x65, hut in the middle, ~5% blocked tiles, crops inside the radius box
+ *  - junimos spawn staggered (1 per 60 ticks), walk 20 ticks/tile (speed 3),
+ *    harvest a crop in 20 ticks (WorkFaster), idle junimos re-decide every ~2 ticks
+ *    (update() -> pokeToHarvest every tick while idle, 70% chance to pathfind)
+ *  - PathFindController: 4-directional A* with expansion budget = `limit`.
+ *    The endFunction variant ("nearest actionable tile") is called with heuristic 0
+ *    -> effectively Dijkstra, so limit 100 reaches only ~5-6 tiles.
+ *    The concrete-target variant uses a Manhattan heuristic (admissible).
+ *
+ * Cadence (verified against the game decompile, JunimoHarvester.update for the
+ * master game): decisions are EVENT-DRIVEN. pathfindToNewCrop runs only from
+ *   (a) walk arrival (reachFirstDestinationFromHut -> tryToHarvestHere -> pokeToHarvest, 70%),
+ *   (b) harvest-timer expiry (update's `else if (harvestTimer <= 0) pokeToHarvest()`, 70%),
+ *   (c) the hut's performTenMinuteAction poke every 10 game-minutes (~430 ticks),
+ *       which re-pokes ALL junimos — walking ones included (the new controller
+ *       replaces the old path); harvesting junimos ignore it (harvestTimer > 0),
+ *   (d) spontaneous idle randoms: 0.2%/frame x 1/6 -> pathfindToNewCrop directly
+ *       (no 70% gate) = one attempt per ~3000 frames while standing idle. These
+ *       randoms live INSIDE the Game1.IsMasterGame branch (they are the else of
+ *       `harvestTimer > 0`), so master-game vanilla junimos DO idle-decide.
+ *
+ * Algorithms:
+ *  legacy          : the ORIGINAL (pre-audit) model — BJ 3.2.0 decision logic at an
+ *                    approximated saturated cadence (70% poke every 2t, re-plan
+ *                    mid-walk every 10t). Kept only as the historical baseline.
+ *  legacy_arrival  : BJ 3.2.0 decision logic (nearest-actionable A* limit 100,
+ *                    50% -> lkc, 25% -> home/despawn, else wander limit 100 x6,
+ *                    3.5% stroll) at the REAL event-driven cadence (a)-(d); no
+ *                    per-frame or per-10t replanning, no decision cap, no claims.
+ *  cap_only        : shipped-patch decision cap (>=20t after success, >=40t after
+ *                    failure) + 60t-cached scan gate, WITHOUT the claim filter.
+ *  v4b_gate_backoff: cap + gate + soft claim filter (nearest-search skips tiles
+ *                    claimed by another junimo; crowded -> shadows the nearest
+ *                    claimed tile from the same Dijkstra pass).
+ *  v4b_realfilter  : the SHIPPED patched build — cap + gate + the real claim-filter
+ *                    semantics: filtered search continues past claims; only when the
+ *                    whole budget finds nothing unclaimed does it re-run ONE
+ *                    unfiltered shadow A* before the lkc/home/wander fallback.
+ *
+ * Pairing methodology: per-run seeds derive from (radius, junimos, density|obstacles,
+ * run) ONLY — never the algorithm name — so every algorithm simulates the IDENTICAL
+ * map for a given run index (paired cross-algorithm comparison).
+ */
+internal static class Cfg {
+    public const int W = 80, H = 65;
+    public const int TICKS_PER_TILE = 20;
+    public const int HARVEST_TICKS = 120;        // 2000ms real cycle: tryToHarvestHere sets 2000, crop lands at the 1000ms crossing
+    public const int DECISION_RETRY_TICKS = 2;
+    public const int RETARGET_INTERVAL = 10;     // legacy only: its approximated saturated cadence re-plans mid-walk
+    public const double POKE_PROB = 0.70;        // pokeToHarvest: 70% -> pathfindToNewCrop
+    public const double WANDER_PROB = 0.035;     // pathfindToNewCrop: 3.5% random stroll
+    public const int HUT_POKE_TICKS = 430;       // performTenMinuteAction re-pokes ALL junimos every 10 game-min
+    public const int IDLE_RANDOM_MEAN_TICKS = 3000; // idle randoms: 0.2%/frame x 1/6 -> pathfindToNewCrop (no 70% gate)
+    public const int WANDER_ATTEMPTS_LEGACY = 6; // BJ 3.2.0: retry <= 5
+    public const int WANDER_ATTEMPTS_PATCHED = 2; // shipped build caps the retries at 2
+    public const int SPAWN_STAGGER_TICKS = 60;
+    public const int SCAN_COOLDOWN_TICKS = 60;
+    public const int LKC_REFRESH_TICKS = 120;
+    public const int EXP_LIMIT_LEGACY = 100;
+    public const int EXP_LIMIT_CLAIMS = 1000;
+    public const int MAX_WORK_TILES = 32;
+    public const int SIM_CAP_TICKS = 240_000;
+    // run counts overridable for smoke runs: JUNIMOSIM_RUNS / JUNIMOSIM_CPU_RUNS
+    public static readonly int RUNS = EnvInt("JUNIMOSIM_RUNS", 20);
+    public static readonly int[] Radii = { 14 };
+    public static readonly int[] JunimoCounts = { 2, 4, 6, 8 };
+    public static readonly string[] Algos = { "legacy", "legacy_arrival", "cap_only", "v4b_gate_backoff", "v4b_realfilter" };
+    // crop density: fraction of free tiles in the working box that hold a crop
+    // 0.75 ≈ circular planting inside the box, 1.00 ≈ fully planted square
+    public static readonly double[] Densities = { 0.75, 1.00 };
+
+    // ---- CPU/day benchmark (steady-state churn is where the lag lives) ----
+    public const int DAY_TICKS = 36000;          // 6:00-20:00 at 430 ticks / 10 game-min
+    public const int BACKOFF_TICKS = 40;         // 0.66s decision backoff after a failed search
+    public const int SUCCESS_CAP_TICKS = 20;     // 0.33s between decisions after a successful one
+    public static readonly int CPU_RUNS = EnvInt("JUNIMOSIM_CPU_RUNS", 5);
+    public static readonly int[] WaveTicks = { 2000, 10000, 18000, 26000 };
+    public static readonly int[] CpuRadii = { 14 };
+    public static readonly int[] CpuJunimos = { 2, 6 };
+    public static readonly string[] CpuAlgos = { "legacy", "legacy_arrival", "cap_only", "v4b_gate_backoff", "v4b_realfilter" };
+    // obstacle rates: open field vs fenced/decorated farm (searches fail -> storm)
+    public static readonly double[] CpuObstacles = { 0.05, 0.25 };
+
+    private static int EnvInt(string name, int def) =>
+        int.TryParse(Environment.GetEnvironmentVariable(name), out var v) && v > 0 ? v : def;
+}
+
+internal static class Program {
+    private static void Main() {
+        Console.OutputEncoding = Encoding.UTF8;
+        var allRuns = new List<(string algo, int radius, int junimos, int run, double density)>();
+        foreach (var density in Cfg.Densities)
+            foreach (var algo in Cfg.Algos)
+                foreach (var r in Cfg.Radii)
+                    foreach (var j in Cfg.JunimoCounts)
+                        for (var run = 0; run < Cfg.RUNS; run++)
+                            allRuns.Add((algo, r, j, run, density));
+
+        var results = new ResultStore();
+        var sw = Stopwatch.StartNew();
+        // multithreaded: each simulation is independent; a single simulation is
+        // inherently sequential (game-loop semantics), so parallelism is across runs
+        Parallel.ForEach(allRuns,
+            new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount },
+            cfg => {
+                // paired methodology: the algorithm name MUST NOT feed the seed, or
+                // different algorithms would simulate different maps per run index.
+                // (System.HashCode is randomized per PROCESS — pairing holds within
+                // this one invocation, which is how the benchmark runs; it is not
+                // reproducible across separate invocations.)
+                var seed = HashCode.Combine(cfg.radius, cfg.junimos, cfg.density, cfg.run);
+                var r = new Simulation(cfg.algo, cfg.radius, cfg.junimos, seed, cropDensity: cfg.density).Run();
+                results.Add(cfg.algo, cfg.radius, cfg.junimos, cfg.density, cfg.run, r);
+            });
+        sw.Stop();
+        Console.WriteLine($"[sim] {allRuns.Count} simulations in {sw.ElapsedMilliseconds} ms on {Environment.ProcessorCount} threads\n");
+
+        Report(results);
+        File.WriteAllText("results.csv", results.ToCsv());
+        Console.WriteLine("\n[sim] CSV written to results.csv");
+
+        CpuBenchmark();
+    }
+
+    // steady-state CPU over a full workday (6:00-20:00), crops ripening in 4 waves:
+    // measures total A* node expansions (= the single-threaded frame cost driver)
+    // and the worst 1-second window (frame spike proxy)
+    private static void CpuBenchmark() {
+        var runs = new List<(string algo, int radius, int junimos, int run, double obs)>();
+        foreach (var algo in Cfg.CpuAlgos)
+            foreach (var r in Cfg.CpuRadii)
+                foreach (var jn in Cfg.CpuJunimos)
+                    foreach (var obs in Cfg.CpuObstacles)
+                        for (var run = 0; run < Cfg.CPU_RUNS; run++)
+                            runs.Add((algo, r, jn, run, obs));
+
+        var store = new CpuStore();
+        var sw = Stopwatch.StartNew();
+        Parallel.ForEach(runs, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, cfg => {
+            // paired: same map for every algorithm at a given (radius, junimos, obs, run)
+            var seed = HashCode.Combine("cpu", cfg.radius, cfg.junimos, cfg.obs, cfg.run);
+            var res = new Simulation(cfg.algo, cfg.radius, cfg.junimos, seed, dayMode: true, obstacleRate: cfg.obs).Run();
+            store.Add(cfg.algo, cfg.radius, cfg.junimos, cfg.obs, cfg.run, res);
+        });
+        sw.Stop();
+
+        Console.WriteLine($"\n[cpu] full-day benchmark: {runs.Count} sims in {sw.ElapsedMilliseconds} ms — radius {string.Join('/', Cfg.CpuRadii)}, waves at t={string.Join(',', Cfg.WaveTicks)}\n");
+        foreach (var obs in Cfg.CpuObstacles) {
+            var label = obs < 0.1 ? "open field (5% obstacles)" : "fenced farm (25% obstacles)";
+            Console.WriteLine($"--- {label} ---");
+            Console.WriteLine($"{"algo",-18} {"junimos",-8} | {"A* pops/day",-12} {"vs legacy",-10} | {"peak pops/1s",-13} {"vs legacy",-10}");
+            Console.WriteLine(new string('-', 80));
+            foreach (var algo in Cfg.CpuAlgos)
+                foreach (var jn in Cfg.CpuJunimos) {
+                    var rs = store.Get(algo, Cfg.CpuRadii[0], jn, obs);
+                    var pops = rs.Average(x => x.Expansions);
+                    var peak = rs.Average(x => x.PeakWindow);
+                    var basePops = store.Get("legacy", Cfg.CpuRadii[0], jn, obs).Average(x => x.Expansions);
+                    var basePeak = store.Get("legacy", Cfg.CpuRadii[0], jn, obs).Average(x => x.PeakWindow);
+                    Console.WriteLine($"{algo,-18} {jn,-8} | {pops,-12:F0} {pops / basePops,-9:F2}x | {peak,-13:F0} {peak / basePeak,-9:F2}x");
+                }
+            Console.WriteLine();
+        }
+        File.WriteAllText("cpu_results.csv", store.ToCsv());
+    }
+
+    private static void Report(ResultStore results) {
+        Console.WriteLine(
+            $"{"algo",-10} {"radius",-7} {"junimos",-8} | {"株数",-6} | {"clear(s) avg",-12} {"sd",-7} | {"A* expans.",-10} | {"deadArrive",-10} | {"respawns",-9} | DNF");
+        Console.WriteLine(new string('-', 112));
+        foreach (var density in Cfg.Densities) {
+            var label = density < 0.5 ? "sparse planting (10% of tiles)" : density < 0.9 ? "circular planting (~75% of tiles)" : "fully planted square (100%)";
+            Console.WriteLine($"--- {label} ---");
+            foreach (var algo in Cfg.Algos)
+                foreach (var r in Cfg.Radii)
+                    foreach (var j in Cfg.JunimoCounts) {
+                        var rs = results.Get(algo, r, j, density);
+                        var done = rs.Where(x => !x.Dnf).ToList();
+                        if (done.Count == 0) {
+                            Console.WriteLine($"{algo,-10} {r,-7} {j,-8} | {"ALL DNF",-6}");
+                            continue;
+                        }
+                        var meanT = done.Average(x => x.ClearTicks) / 60.0;
+                        var sdT = Math.Sqrt(done.Average(x => Math.Pow(x.ClearTicks / 60.0 - meanT, 2)));
+                        Console.WriteLine(
+                            $"{algo,-10} {r,-7} {j,-8} | {done.Average(x => x.CropCount),-6:F0} | {meanT,-12:F2} {sdT,-7:F2} | {done.Average(x => x.Expansions),-10:F0} | {done.Average(x => x.WastedArrivals),-10:F1} | {done.Average(x => x.Respawns),-9:F1} | {rs.Count - done.Count}");
+                    }
+            Console.WriteLine();
+        }
+    }
+}
+
+internal readonly struct RunResult {
+    public RunResult(long clearTicks, long expansions, int wastedArrivals, int respawns, long scanOps, long peakWindow, int cropCount, bool dnf) {
+        ClearTicks = clearTicks; Expansions = expansions; WastedArrivals = wastedArrivals; Respawns = respawns; ScanOps = scanOps; PeakWindow = peakWindow; CropCount = cropCount; Dnf = dnf;
+    }
+    public readonly long ClearTicks;
+    public readonly long Expansions;
+    public readonly int WastedArrivals;
+    public readonly int Respawns;
+    public readonly long ScanOps;
+    public readonly long PeakWindow; // day mode: max A* pops in any 60-tick (1s) window
+    public readonly int CropCount;
+    public readonly bool Dnf;
+}
+
+internal sealed class CpuStore {
+    private readonly object _lock = new();
+    private readonly Dictionary<(string, int, int, double), List<(int run, RunResult r)>> _map = new();
+
+    // keep the TRUE run index: store lists fill in completion order, which would
+    // otherwise scramble per-run pairing in the CSV
+    public void Add(string algo, int radius, int junimos, double obs, int run, RunResult r) {
+        lock (_lock) {
+            var key = (algo, radius, junimos, obs);
+            if (!_map.TryGetValue(key, out var list)) _map[key] = list = new List<(int, RunResult)>();
+            list.Add((run, r));
+        }
+    }
+
+    public List<RunResult> Get(string algo, int radius, int junimos, double obs) {
+        lock (_lock) { return _map.TryGetValue((algo, radius, junimos, obs), out var l) ? l.Select(x => x.r).ToList() : new List<RunResult>(); }
+    }
+
+    public string ToCsv() {
+        var sb = new StringBuilder("algo,junimos,obstacles,run,total_pops,peak_pops_1s\n");
+        foreach (var ((algo, r, j, obs), list) in _map)
+            foreach (var (run, x) in list)
+                sb.AppendLine($"{algo},{j},{obs},{run},{x.Expansions},{x.PeakWindow}");
+        return sb.ToString();
+    }
+}
+
+internal sealed class ResultStore {
+    private readonly object _lock = new();
+    private readonly Dictionary<(string, int, int, double), List<(int run, RunResult r)>> _map = new();
+
+    // keep the TRUE run index: store lists fill in completion order, which would
+    // otherwise scramble per-run pairing in the CSV
+    public void Add(string algo, int radius, int junimos, double density, int run, RunResult r) {
+        lock (_lock) {
+            var key = (algo, radius, junimos, density);
+            if (!_map.TryGetValue(key, out var list)) _map[key] = list = new List<(int, RunResult)>();
+            list.Add((run, r));
+        }
+    }
+
+    public List<RunResult> Get(string algo, int radius, int junimos, double density) {
+        lock (_lock) { return _map.TryGetValue((algo, radius, junimos, density), out var l) ? l.Select(x => x.r).ToList() : new List<RunResult>(); }
+    }
+
+    public string ToCsv() {
+        var sb = new StringBuilder("algo,radius,junimos,density,run,clear_ticks,crops,expansions,wasted_arrivals,respawns,scan_ops,dnf\n");
+        foreach (var ((algo, r, j, d), list) in _map)
+            foreach (var (run, x) in list) {
+                sb.AppendLine($"{algo},{r},{j},{d},{run},{x.ClearTicks},{x.CropCount},{x.Expansions},{x.WastedArrivals},{x.Respawns},{x.ScanOps},{x.Dnf}");
+            }
+        return sb.ToString();
+    }
+}
+
+/* ------------------------------- simulation ------------------------------- */
+
+internal sealed class Junimo {
+    public enum St { WaitingDecision, Walking, Working, WaitingRespawn }
+
+    public St State;
+    public long NextEventTick;
+    public int TargetTile;
+    public int Pos;
+    public List<int> Path;        // steps of the current walk; Path[^1] == TargetTile
+    public int Origin;            // tile the walk started from
+    public long WalkStartTick;
+    public bool Retargets;        // vanilla cadence: re-plan mid-walk (legacy & v4b pre-cap)
+}
+
+internal sealed class Simulation {
+    private readonly string _algo;
+    private readonly int _radius;
+    private readonly int _junimoCount;
+    private readonly Random _rnd;
+
+    private readonly bool[] _blocked = new bool[Cfg.W * Cfg.H];
+    private readonly double _obstacleRate;
+    private readonly HashSet<int> _crops = new();
+    private readonly HashSet<int> _reserved = new();  // tiles whose crop is committed to a harvesting junimo
+    private readonly List<Junimo> _junimos = new();
+
+    // shared per-hut state
+    private readonly List<int> _workTiles = new();            // claims v1/v2b: scan list (row-major, capped)
+    private readonly Dictionary<int, Junimo> _claims = new(); // tile -> owner
+    private readonly Dictionary<Junimo, int> _ownerClaim = new();
+    private long _lastScanTick = long.MinValue / 2;
+    private int _lkc = -1;                                    // legacy shared lastKnownCropLocation
+
+    private long _expansions;
+    private long _scanOps;
+    private bool _lastSearchShadow; // AStarNearest(self!=null): endpoint was claimed by another junimo
+    private List<int> _shadowPath;  // path to the nearest claimed crop, remembered by a failed skip-claims search
+
+    // day/CPU mode
+    private readonly bool _dayMode;
+    private long[] _tickPops;
+    private readonly List<(long tick, int tile)> _waves = new();
+    private int _waveIdx;
+    private long _gateScanTick = long.MinValue / 2;
+    private bool _cachedHasWork;
+    private readonly Dictionary<Junimo, long> _backoff = new();
+    private readonly double _cropDensity;
+    private int _cropCount;
+    private int _wastedArrivals;
+    private int _respawns;
+    private long _tick;
+    private long _nextPokeTick;
+
+    public Simulation(string algo, int radius, int junimos, int seed, bool dayMode = false, double obstacleRate = 0.05, double cropDensity = 0.10) {
+        _algo = algo; _radius = radius; _junimoCount = junimos; _rnd = new Random(seed); _dayMode = dayMode; _obstacleRate = obstacleRate; _cropDensity = cropDensity;
+        if (dayMode) _tickPops = new long[Cfg.DAY_TICKS + 1];
+    }
+
+    private void AddPops(long pops) {
+        _expansions += pops;
+        if (_dayMode && _tick >= 0 && _tick < _tickPops.Length) _tickPops[_tick] += pops;
+    }
+
+    private static int Idx(int x, int y) => y * Cfg.W + x;
+    private static int XOf(int idx) => idx % Cfg.W;
+    private static int YOf(int idx) => idx / Cfg.W;
+    private static int Man(int a, int b) => Math.Abs(XOf(a) - XOf(b)) + Math.Abs(YOf(a) - YOf(b));
+
+    public RunResult Run() {
+        BuildMap();
+
+        for (var i = 0; i < _junimoCount; i++)
+            _junimos.Add(new Junimo { State = Junimo.St.WaitingRespawn, NextEventTick = 1 + i * Cfg.SPAWN_STAGGER_TICKS, Pos = HutTile(), Retargets = _algo is "legacy" or "claims_v4b" });
+
+        // spawn-time scan (areThereMatureCropsWithinRadius on the first spawn driver tick)
+        if (_algo != "legacy") ScanWorkTiles(Cfg.MAX_WORK_TILES);
+
+        long tick = 0;
+        var remaining = _crops.Count;
+        _nextPokeTick = Cfg.HUT_POKE_TICKS;
+        while (_dayMode ? tick < Cfg.DAY_TICKS : (tick < Cfg.SIM_CAP_TICKS && remaining > 0)) {
+            // day mode: ripen the next wave of crops
+            while (_waveIdx < _waves.Count && _waves[_waveIdx].tick <= tick) {
+                _crops.Add(_waves[_waveIdx].tile);
+                _waveIdx++;
+            }
+            Junimo next = null;
+            var nextTick = long.MaxValue;
+            foreach (var j in _junimos) {
+                if (j.State == Junimo.St.WaitingRespawn && j.NextEventTick <= tick) {
+                    // respawn: appear at the hut, ready to decide
+                    j.State = Junimo.St.WaitingDecision;
+                    j.NextEventTick = tick;
+                    j.Pos = HutTile();
+                }
+                if (j.NextEventTick < nextTick) { nextTick = j.NextEventTick; next = j; }
+            }
+            if (next == null) break;
+            var eventTick = Math.Min(nextTick, _nextPokeTick);
+            if (_dayMode && eventTick > Cfg.DAY_TICKS) eventTick = Cfg.DAY_TICKS;
+            tick = Math.Max(tick, eventTick);
+            _tick = tick;
+
+            // the hut's performTenMinuteAction re-pokes EVERY junimo (walking ones
+            // included) every 10 game-minutes — this is what syncs decision bursts
+            if (_nextPokeTick <= nextTick) {
+                DoHutPoke(tick);
+                _nextPokeTick += Cfg.HUT_POKE_TICKS;
+                continue;
+            }
+
+            switch (next.State) {
+                case Junimo.St.WaitingDecision:
+                    if (_algo == "legacy_arrival") {
+                        // this event IS a spontaneous idle random: update() calls
+                        // pathfindToNewCrop DIRECTLY (no 70% poke gate); re-arm if still idle
+                        Decide(next, tick);
+                        if (next.State == Junimo.St.WaitingDecision)
+                            next.NextEventTick = tick + SampleIdleRandom();
+                        break;
+                    }
+                    if (_rnd.NextDouble() >= Cfg.POKE_PROB) { next.NextEventTick = tick + Cfg.DECISION_RETRY_TICKS; break; }
+                    Decide(next, tick);
+                    break;
+
+                case Junimo.St.Walking: {
+                    var elapsed = tick - next.WalkStartTick;
+                    var progress = (int)(elapsed / Cfg.TICKS_PER_TILE);
+                    if (next.Path == null || progress >= next.Path.Count) {
+                        // arrived: first junimo to reach a crop commits it (the real
+                        // game harvests at the animation crossing; followers find nothing)
+                        var tile = next.Path != null && next.Path.Count > 0 ? next.Path[^1] : next.Pos;
+                        next.Pos = tile;
+                        if (_crops.Contains(tile) && !_reserved.Contains(tile)) {
+                            _reserved.Add(tile);
+                            next.State = Junimo.St.Working;
+                            next.NextEventTick = tick + Cfg.HARVEST_TICKS;
+                        } else {
+                            // dead tile: someone harvested it first (or the plan went stale)
+                            _wastedArrivals++;
+                            // real patch: PatchTryToHarvestHere releases the junimo's OWN
+                            // claim (owner-scoped) on every "nothing to do" arrival — the
+                            // claim may be on a different tile than this one (shadow walks)
+                            if (_algo != "legacy") ReleaseOwnClaim(next);
+                            if (_algo == "claims_v2b") _workTiles.Remove(tile);
+                            if (_algo == "legacy_arrival") {
+                                // vanilla tryToHarvestHere -> pokeToHarvest: one 70%
+                                // decision attempt right now; otherwise stand idle until
+                                // the next hut poke or idle random
+                                if (_rnd.NextDouble() < Cfg.POKE_PROB) Decide(next, tick);
+                                if (next.State == Junimo.St.WaitingDecision)
+                                    next.NextEventTick = tick + SampleIdleRandom();
+                            } else {
+                                next.State = Junimo.St.WaitingDecision;
+                                next.NextEventTick = tick + Cfg.DECISION_RETRY_TICKS;
+                            }
+                        }
+                        break;
+                    }
+
+                    // mid-walk re-planning: vanilla re-runs the work search ~70%/frame
+                    // while walking, constantly redirecting toward the current nearest
+                    // crop — this is what builds the converging trains
+                    if (next.Retargets && _rnd.NextDouble() < Cfg.POKE_PROB) {
+                        var cur = progress == 0 ? next.Origin : next.Path[progress - 1];
+                        next.Pos = cur;
+                        Retarget(next, tick, cur);
+                    }
+
+                    if (next.State == Junimo.St.Walking) {
+                        next.NextEventTick = tick + Cfg.RETARGET_INTERVAL;
+                    }
+                    break;
+                }
+
+                case Junimo.St.Working: {
+                    _crops.Remove(next.TargetTile);
+                    remaining--;
+                    _reserved.Remove(next.TargetTile);
+                    // real: tryToAddItemToHut prefix releases the owner's claim
+                    // (owner-scoped — a shadowing junimo's stale claim dies here too)
+                    ReleaseOwnClaim(next);
+                    if (_algo == "claims_v2b") _workTiles.Remove(next.TargetTile); // prune harvested tile so nobody chases it
+                    if (_algo == "legacy_arrival") {
+                        // harvestTimer crossed <= 0 -> pokeToHarvest (70% chance to re-decide)
+                        if (_rnd.NextDouble() < Cfg.POKE_PROB) Decide(next, tick);
+                        if (next.State == Junimo.St.WaitingDecision)
+                            next.NextEventTick = tick + SampleIdleRandom();
+                    } else {
+                        next.State = Junimo.St.WaitingDecision;
+                        next.NextEventTick = tick + Cfg.DECISION_RETRY_TICKS;
+                    }
+                    break;
+                }
+            }
+        }
+
+        var peak = 0L;
+        if (_dayMode) {
+            long sum = 0;
+            for (var i = 0; i < _tickPops.Length; i++) {
+                sum += _tickPops[i];
+                if (i >= 60) sum -= _tickPops[i - 60];
+                if (sum > peak) peak = sum;
+            }
+        }
+
+        return new RunResult(tick, _expansions, _wastedArrivals, _respawns, _scanOps, peak, _cropCount, _dayMode ? false : remaining > 0);
+    }
+
+    private int HutTile() => Idx(Cfg.W / 2, Cfg.H / 2);
+
+    private void BuildMap() {
+        var rng = new Random(_rnd.Next());
+        for (var i = 0; i < Cfg.W * Cfg.H; i++)
+            if (rng.NextDouble() < _obstacleRate) _blocked[i] = true;
+
+        var hut = HutTile();
+        _blocked[hut] = true; _blocked[hut + 1] = true; _blocked[hut + Cfg.W] = true; _blocked[hut + Cfg.W + 1] = true;
+
+        // only place crops reachable from the hut, so every run is completable
+        var reach = new bool[Cfg.W * Cfg.H];
+        var queue = new Queue<int>();
+        reach[hut] = true;
+        queue.Enqueue(hut);
+        while (queue.Count > 0) {
+            var cur = queue.Dequeue();
+            foreach (var n in Neighbors(cur)) {
+                if (reach[n] || _blocked[n]) continue;
+                reach[n] = true;
+                queue.Enqueue(n);
+            }
+        }
+
+        var candidates = new List<int>();
+        var hx = XOf(hut); var hy = YOf(hut);
+        for (var x = hx + 1 - _radius; x <= hx + _radius; x++)
+            for (var y = hy + 1 - _radius; y <= hy + _radius; y++) {
+                if (x < 0 || y < 0 || x >= Cfg.W || y >= Cfg.H) continue;
+                var idx = Idx(x, y);
+                if (!_blocked[idx] && reach[idx]) candidates.Add(idx);
+            }
+        for (var i = candidates.Count - 1; i > 0; i--) {
+            var k = rng.Next(i + 1);
+            (candidates[i], candidates[k]) = (candidates[k], candidates[i]);
+        }
+        var target = (int)Math.Round(candidates.Count * _cropDensity);
+        _cropCount = target;
+        if (_dayMode) {
+            // crops ripen in waves so the day has idle periods (the churn source)
+            var per = Math.Max(1, target / Cfg.WaveTicks.Length);
+            for (var w = 0; w < Cfg.WaveTicks.Length; w++)
+                foreach (var t in candidates.Skip(w * per).Take(per))
+                    _waves.Add((Cfg.WaveTicks[w], t));
+        } else {
+            foreach (var t in candidates.Take(target)) _crops.Add(t);
+        }
+    }
+
+    private IEnumerable<int> Neighbors(int idx) {
+        var x = XOf(idx); var y = YOf(idx);
+        if (x > 0) yield return idx - 1;
+        if (x < Cfg.W - 1) yield return idx + 1;
+        if (y > 0) yield return idx - Cfg.W;
+        if (y < Cfg.H - 1) yield return idx + Cfg.W;
+    }
+
+    /* ------------------------------ A* models ------------------------------ */
+
+    // "nearest actionable tile" like foundCropEndFunction: no heuristic (Dijkstra),
+    // endFunction checked on pop, expansion budget = limit.
+    // With skipClaimed (claim filter on), tiles claimed by ANOTHER junimo fail the
+    // end check and the search CONTINUES (PatchFindingCropEnd semantics); the first
+    // claimed crop popped is remembered (with its path) so a failed search can still
+    // shadow it — the same Dijkstra pass already knows where it is.
+    private List<int> AStarNearest(int start, int limit, Junimo self = null, bool skipClaimed = false) {
+        var open = new PriorityQueue<int, (long g, long seq)>();
+        long seq = 0;
+        var gScore = new Dictionary<int, long> { [start] = 0 };
+        var cameFrom = new Dictionary<int, int>();
+        var closed = new HashSet<int>();
+        open.Enqueue(start, (0, seq++));
+        _shadowPath = null;
+        _lastSearchShadow = false;
+
+        long pops = 0;
+        while (open.Count > 0) {
+            var cur = open.Dequeue();
+            if (closed.Contains(cur)) continue;
+            closed.Add(cur);
+            pops++;
+            if (pops > limit) { AddPops(pops); if (_shadowPath != null) _lastSearchShadow = true; return null; }
+
+            var claimedByOther = self != null && _claims.TryGetValue(cur, out var owner) && !ReferenceEquals(owner, self);
+            // real mod (PatchFindingCropEnd): a claimed tile's end check returns false,
+            // so findPath keeps searching for the next-nearest unclaimed crop
+            if (cur != start && _crops.Contains(cur)) {
+                if (claimedByOther) {
+                    if (!skipClaimed) {
+                        AddPops(pops);
+                        _lastSearchShadow = true;
+                        return Reconstruct(cameFrom, cur);
+                    }
+                    if (_shadowPath == null) _shadowPath = Reconstruct(cameFrom, cur);
+                } else {
+                    AddPops(pops);
+                    return Reconstruct(cameFrom, cur);
+                }
+            }
+
+            foreach (var n in Neighbors(cur)) {
+                if (_blocked[n] || closed.Contains(n)) continue;
+                var g = gScore[cur] + 1;
+                if (gScore.TryGetValue(n, out var old) && g >= old) continue;
+                gScore[n] = g;
+                cameFrom[n] = cur;
+                open.Enqueue(n, (g, seq++));
+            }
+        }
+        AddPops(pops);
+        if (_shadowPath != null) _lastSearchShadow = true;
+        return null;
+    }
+
+    // concrete-target A* with Manhattan heuristic (like PathFindController's Point ctor)
+    private List<int> AStarTo(int start, int target, int limit) {
+        var open = new PriorityQueue<int, (long f, long seq)>();
+        long seq = 0;
+        var gScore = new Dictionary<int, long> { [start] = 0 };
+        var cameFrom = new Dictionary<int, int>();
+        var closed = new HashSet<int>();
+        open.Enqueue(start, (Man(start, target), seq++));
+
+        long pops = 0;
+        while (open.Count > 0) {
+            var cur = open.Dequeue();
+            if (closed.Contains(cur)) continue;
+            closed.Add(cur);
+            pops++;
+            if (pops > limit) { AddPops(pops); return null; }
+            if (cur == target) { AddPops(pops); return Reconstruct(cameFrom, cur); }
+
+            foreach (var n in Neighbors(cur)) {
+                if (_blocked[n] || closed.Contains(n)) continue;
+                var g = gScore[cur] + 1;
+                if (gScore.TryGetValue(n, out var old) && g >= old) continue;
+                gScore[n] = g;
+                cameFrom[n] = cur;
+                open.Enqueue(n, (g + Man(n, target), seq++));
+            }
+        }
+        AddPops(pops);
+        return null;
+    }
+
+    private List<int> Reconstruct(Dictionary<int, int> cameFrom, int end) {
+        var path = new List<int>();
+        var cur = end;
+        while (cameFrom.TryGetValue(cur, out var prev)) { path.Add(cur); cur = prev; }
+        path.Reverse();
+        return path;
+    }
+
+    /* --------------------------- scans / claims ---------------------------- */
+
+    // row-major scan of the radius box with early exit at `cap` actionable tiles;
+    // legacy only needs the first tile (lkc), claim allocators build the work list
+    private void ScanWorkTiles(int cap) {
+        _workTiles.Clear();
+        var hut = HutTile();
+        var hx = XOf(hut); var hy = YOf(hut);
+        for (var x = hx + 1 - _radius; x <= hx + _radius && _workTiles.Count < cap; x++)
+            for (var y = hy + 1 - _radius; y <= hy + _radius; y++) {
+                if (x < 0 || y < 0 || x >= Cfg.W || y >= Cfg.H) continue;
+                _scanOps++;
+                if (_crops.Contains(Idx(x, y))) {
+                    _workTiles.Add(Idx(x, y));
+                    if (_workTiles.Count >= cap) break;
+                }
+            }
+        _lastScanTick = _tick;
+        if (_workTiles.Count > 0) _lkc = _workTiles[0];
+        else _lkc = -1; // vanilla/patched scans reset lastKnownCropLocation to Zero when nothing is found
+    }
+
+    // CropClaims.ReleaseOwner: owner-scoped. Removes the junimo's owner mapping and
+    // the tile claim only if it still points at this junimo (never another's claim).
+    private void ReleaseOwnClaim(Junimo j) {
+        if (!_ownerClaim.Remove(j, out var tile)) return;
+        if (_claims.TryGetValue(tile, out var owner) && ReferenceEquals(owner, j)) _claims.Remove(tile);
+    }
+
+    /* ------------------------------ decisions ------------------------------ */
+
+    // the shipped patch's decision-capped algos
+    private bool IsCappedAlgo => _algo is "cap_only" or "v4b_gate_backoff" or "v4b_realfilter";
+
+    private void Decide(Junimo j, long tick) {
+        // decision rate cap (PatchPathfindDoWork): checked BEFORE everything — a
+        // capped junimo keeps its current path / stands still, and does not even
+        // roll the 3.5% stroll. >=20t after success, >=40t after failure.
+        if (IsCappedAlgo && _backoff.TryGetValue(j, out var until) && tick < until) {
+            j.State = Junimo.St.WaitingDecision;
+            j.NextEventTick = tick + Cfg.DECISION_RETRY_TICKS;
+            return;
+        }
+
+        if (_rnd.NextDouble() < Cfg.WANDER_PROB) {
+            Wander(j, tick);
+            // the real code sets NextDecisionTick on the stroll too (real line: before
+            // pathfindToRandomSpotAroundHut)
+            if (IsCappedAlgo) _backoff[j] = tick + Cfg.SUCCESS_CAP_TICKS;
+            return;
+        }
+
+        switch (_algo) {
+            case "legacy": DecideLegacy(j, tick); break;
+            case "claims_v2b": DecideClaims(j, tick, v2: true); break;
+            case "claims_v3": DecideV3(j, tick); break;
+            case "claims_v4b": DecideV4b(j, tick, gate: false, backoff: false); break;
+            case "v4b_shipped": DecideV4b(j, tick, gate: false, backoff: false); break;
+            case "v4b_gate": DecideV4b(j, tick, gate: true, backoff: false); break;
+            case "v4b_gate_backoff": DecideV4b(j, tick, gate: true, backoff: true); break;
+            case "cap_only": DecideCapOnly(j, tick); break;
+            case "legacy_arrival": DecideLegacy(j, tick); break;
+            case "v4b_realfilter": DecideV4bRealFilter(j, tick); break;
+        }
+    }
+
+    private void DecideLegacy(Junimo j, long tick) {
+        // legacy: the scan only refreshes via the spawn driver; approximate 120 ticks;
+        // it only needs the FIRST actionable tile (lkc), like the real early-exit scan
+        if (tick - _lastScanTick >= Cfg.LKC_REFRESH_TICKS) ScanWorkTiles(cap: 1);
+
+        var path = AStarNearest(j.Pos, Cfg.EXP_LIMIT_LEGACY);
+        if (path != null) { StartWalk(j, path, tick); return; }
+
+        var roll = _rnd.NextDouble();
+        if (roll < 0.5 && _lkc >= 0 && _crops.Contains(_lkc)) {
+            var p = AStarTo(j.Pos, _lkc, Cfg.EXP_LIMIT_LEGACY);
+            if (p != null) { StartWalk(j, p, tick); return; }
+            roll = _rnd.NextDouble(); // fall through to the next roll
+        } else {
+            roll = _rnd.NextDouble();
+        }
+
+        if (roll < 0.25) {
+            // "unlucky, send Junimo home" -> returnToJunimoHut -> despawn + respawn
+            _respawns++;
+            j.State = Junimo.St.WaitingRespawn;
+            j.NextEventTick = tick + Cfg.SPAWN_STAGGER_TICKS;
+        } else {
+            Wander(j, tick);
+        }
+    }
+
+    private void DecideClaims(Junimo j, long tick, bool v2) {
+        if (v2 && tick - _lastScanTick >= Cfg.SCAN_COOLDOWN_TICKS) ScanWorkTiles(Cfg.MAX_WORK_TILES);
+        // v1: list stays frozen (the shipped bug)
+
+        int? best = null;
+        var bestDist = int.MaxValue;
+        foreach (var t in _workTiles) {
+            if (_claims.TryGetValue(t, out var owner) && !ReferenceEquals(owner, j)) continue;
+            var d = Man(j.Pos, t);
+            if (d < bestDist) { bestDist = d; best = t; }
+        }
+
+        if (best == null) {
+            if (!v2) { Wander(j, tick); return; }            // v1 as shipped
+            j.State = Junimo.St.WaitingDecision;             // v2b: wait, don't pile on
+            j.NextEventTick = tick + Cfg.DECISION_RETRY_TICKS;
+            return;
+        }
+
+        var tile = best.Value;
+        _claims[tile] = j;
+        _ownerClaim[j] = tile;
+        var p2 = AStarTo(j.Pos, tile, v2 ? Cfg.EXP_LIMIT_CLAIMS : Cfg.EXP_LIMIT_LEGACY);
+        if (p2 != null) { StartWalk(j, p2, tick); return; }
+
+        // unreachable with the budget: v2b drops the tile so nobody retries it this scan
+        if (_claims.TryGetValue(tile, out var o) && ReferenceEquals(o, j)) _claims.Remove(tile);
+        _ownerClaim.Remove(j);
+        if (v2) _workTiles.Remove(tile);
+        j.State = Junimo.St.WaitingDecision;
+        j.NextEventTick = tick + Cfg.DECISION_RETRY_TICKS;
+    }
+
+    // claims_v4b: legacy logic + soft claim filter. The nearest-search SKIPS tiles
+    // claimed by another junimo and keeps searching (skip-and-continue); if no
+    // unclaimed actionable tile exists within the budget (crowded), it shadows the
+    // nearest claimed crop that the SAME Dijkstra pass popped — no failure, no extra
+    // search. lkc fallback chain unchanged from legacy.
+    // gate: consult the cached 60t hut work scan before any pathfinding. scan=false
+    // => no actionable tile inside the radius box, and the search discards endpoints
+    // outside the box anyway, so the searches below could never succeed — vanilla
+    // burned 2-3 full-budget A* per frame per idle junimo on exactly this case.
+    // backoff: after a failed work search, wait 0.66s before searching again (the
+    // decision loop otherwise retries ~70%/frame per idle junimo).
+    private void DecideV4b(Junimo j, long tick, bool gate, bool backoff) {
+        if (gate) {
+            if (tick - _gateScanTick >= Cfg.SCAN_COOLDOWN_TICKS) {
+                ScanWorkTiles(cap: 1);
+                _cachedHasWork = _workTiles.Count > 0;
+                _gateScanTick = tick;
+            }
+            if (!_cachedHasWork) { VanillaTail(j, tick, allowLkc: false); return; }
+        } else if (tick - _lastScanTick >= Cfg.LKC_REFRESH_TICKS) {
+            ScanWorkTiles(cap: 1); // legacy lkc refresh (spawn-driver scans)
+        }
+
+        // (decision cap handled at the top of Decide)
+
+        var path = AStarNearest(j.Pos, Cfg.EXP_LIMIT_LEGACY, self: j, skipClaimed: true);
+        if (path == null && _lastSearchShadow && _shadowPath != null) {
+            // crowded: every actionable tile within budget is claimed by someone —
+            // shadow the nearest claimed crop (no extra search; the skip-claims pass
+            // remembered it). Real mod equivalent runs the search unfiltered again.
+            path = _shadowPath;
+        }
+        if (path != null) {
+            // shipped build: cap decisions after success too (0.33s), not only failures
+            _backoff[j] = tick + Cfg.SUCCESS_CAP_TICKS;
+            if (_lastSearchShadow) {
+                // crowded: shadow another junimo, exactly like vanilla — walk there
+                // but do NOT take (or steal) the claim
+                StartWalk(j, path, tick);
+                return;
+            }
+            ReleaseOwnClaim(j);
+            var end = path[^1];
+            _claims[end] = j;
+            _ownerClaim[j] = end;
+            StartWalk(j, path, tick);
+            return;
+        }
+
+        // search failed: free any stale claim, back off before the next attempt
+        ReleaseOwnClaim(j);
+        if (backoff) _backoff[j] = tick + Cfg.BACKOFF_TICKS;
+
+        var roll = _rnd.NextDouble();
+        if (roll < 0.5 && _lkc >= 0 && _crops.Contains(_lkc)) {
+            var p = AStarTo(j.Pos, _lkc, Cfg.EXP_LIMIT_LEGACY);
+            if (p != null) { StartWalk(j, p, tick); return; }
+            roll = _rnd.NextDouble();
+        } else {
+            roll = _rnd.NextDouble();
+        }
+
+        if (roll < 0.25) {
+            _respawns++;
+            j.State = Junimo.St.WaitingRespawn;
+            j.NextEventTick = tick + Cfg.SPAWN_STAGGER_TICKS;
+        } else {
+            Wander(j, tick);
+        }
+    }
+
+    // v4b_gate_backoff with the REAL mod claim-filter semantics: the filtered end
+    // check skips tiles claimed by another junimo and keeps searching; only when no
+    // unclaimed actionable tile exists in the whole budget does the mod re-run the
+    // search unfiltered (a second full A*) and shadow the nearest claimed tile.
+    private void DecideV4bRealFilter(Junimo j, long tick) {
+        if (tick - _gateScanTick >= Cfg.SCAN_COOLDOWN_TICKS) {
+            ScanWorkTiles(cap: 1);
+            _cachedHasWork = _workTiles.Count > 0;
+            _gateScanTick = tick;
+        }
+        if (!_cachedHasWork) { VanillaTail(j, tick, allowLkc: false); return; }
+
+        var path = AStarNearest(j.Pos, Cfg.EXP_LIMIT_LEGACY, self: j, skipClaimed: true);
+        var shadow = false;
+        if (path == null) {
+            // crowded: unfiltered shadow re-search, exactly like PatchPathfindDoWork
+            shadow = true;
+            path = AStarNearest(j.Pos, Cfg.EXP_LIMIT_LEGACY, self: null);
+        }
+        if (path != null) {
+            _backoff[j] = tick + Cfg.SUCCESS_CAP_TICKS;
+            if (shadow) {
+                // shadowing a claimed tile: the real mod's TryClaim is skipped
+                // (tile claimed by other) and no ReleaseOwner runs on this path
+                StartWalk(j, path, tick);
+                return;
+            }
+            ReleaseOwnClaim(j);
+            var end = path[^1];
+            _claims[end] = j;
+            _ownerClaim[j] = end;
+            StartWalk(j, path, tick);
+            return;
+        }
+
+        // search failed: free any stale claim, back off before the next attempt
+        ReleaseOwnClaim(j);
+        _backoff[j] = tick + Cfg.BACKOFF_TICKS;
+
+        var roll = _rnd.NextDouble();
+        if (roll < 0.5 && _lkc >= 0 && _crops.Contains(_lkc)) {
+            var p = AStarTo(j.Pos, _lkc, Cfg.EXP_LIMIT_LEGACY);
+            if (p != null) { StartWalk(j, p, tick); return; }
+            roll = _rnd.NextDouble();
+        } else {
+            roll = _rnd.NextDouble();
+        }
+
+        if (roll < 0.25) {
+            _respawns++;
+            j.State = Junimo.St.WaitingRespawn;
+            j.NextEventTick = tick + Cfg.SPAWN_STAGGER_TICKS;
+        } else {
+            Wander(j, tick);
+        }
+    }
+
+    // cap_only: the decision rate cap + scan gate WITHOUT the claim filter —
+    // vanilla target choice, throttled. Isolates how much of the throughput gain
+    // comes from the despawn-spiral fix (cap) vs the anti-clump filter (claims).
+    private void DecideCapOnly(Junimo j, long tick) {
+        if (tick - _gateScanTick >= Cfg.SCAN_COOLDOWN_TICKS) {
+            ScanWorkTiles(cap: 1);
+            _cachedHasWork = _workTiles.Count > 0;
+            _gateScanTick = tick;
+        }
+        if (!_cachedHasWork) { VanillaTail(j, tick, allowLkc: false); return; }
+
+        var path = AStarNearest(j.Pos, Cfg.EXP_LIMIT_LEGACY);
+        if (path != null) {
+            _backoff[j] = tick + Cfg.SUCCESS_CAP_TICKS;
+            StartWalk(j, path, tick);
+            return;
+        }
+
+        // search failed: back off longer before the next attempt
+        _backoff[j] = tick + Cfg.BACKOFF_TICKS;
+
+        var roll = _rnd.NextDouble();
+        if (roll < 0.5 && _lkc >= 0 && _crops.Contains(_lkc)) {
+            var p = AStarTo(j.Pos, _lkc, Cfg.EXP_LIMIT_LEGACY);
+            if (p != null) { StartWalk(j, p, tick); return; }
+            roll = _rnd.NextDouble();
+        } else {
+            roll = _rnd.NextDouble();
+        }
+
+        if (roll < 0.25) {
+            _respawns++;
+            j.State = Junimo.St.WaitingRespawn;
+            j.NextEventTick = tick + Cfg.SPAWN_STAGGER_TICKS;
+        } else {
+            Wander(j, tick);
+        }
+    }
+
+    // the vanilla fallback tail: 50% lkc (when there is work), 25% home, else wander
+    private void VanillaTail(Junimo j, long tick, bool allowLkc) {
+        var roll = _rnd.NextDouble();
+        if (allowLkc && roll < 0.5 && _lkc >= 0 && _crops.Contains(_lkc)) {
+            var p = AStarTo(j.Pos, _lkc, Cfg.EXP_LIMIT_LEGACY);
+            if (p != null) { StartWalk(j, p, tick); return; }
+            roll = _rnd.NextDouble();
+        } else {
+            roll = _rnd.NextDouble();
+        }
+        if (roll < 0.25) {
+            _respawns++;
+            j.State = Junimo.St.WaitingRespawn;
+            j.NextEventTick = tick + Cfg.SPAWN_STAGGER_TICKS;
+        } else {
+            Wander(j, tick);
+        }
+    }
+
+    // JunimoHut.performTenMinuteAction: pokeToHarvest() on EVERY junimo of the hut
+    // every 10 game-minutes. Walking junimos are included (pathfindToNewCrop replaces
+    // the controller — the old path is abandoned); harvesting junimos ignore the poke
+    // (their harvestTimer > 0 fails pokeToHarvest's own guard); unspawned ones are not
+    // in myJunimos. Each poke is gated by the 70% pokeToHarvest roll; capped algos
+    // additionally keep the current path while inside the decision cap.
+    private void DoHutPoke(long tick) {
+        foreach (var j in _junimos) {
+            if (j.State == Junimo.St.WaitingRespawn || j.State == Junimo.St.Working) continue;
+            if (_algo == "legacy") continue; // saturated cadence model; a 430t poke changes nothing
+            if (j.State == Junimo.St.Walking) {
+                if (_rnd.NextDouble() >= Cfg.POKE_PROB) continue; // pokeToHarvest 70% gate
+                if (IsCappedAlgo && _backoff.TryGetValue(j, out var until) && tick < until) continue; // cap: keep walking
+                var progress = (int)((tick - j.WalkStartTick) / Cfg.TICKS_PER_TILE);
+                j.Pos = progress <= 0 ? j.Origin : j.Path[Math.Min(progress, j.Path.Count) - 1];
+                Decide(j, tick);
+                if (j.State == Junimo.St.WaitingDecision && _algo == "legacy_arrival")
+                    j.NextEventTick = tick + SampleIdleRandom();
+            } else { // WaitingDecision: idle, standing
+                if (_algo == "legacy_arrival") {
+                    if (_rnd.NextDouble() < Cfg.POKE_PROB) Decide(j, tick);
+                    if (j.State == Junimo.St.WaitingDecision)
+                        j.NextEventTick = tick + SampleIdleRandom();
+                } else {
+                    // capped algos: attempt now — the 70% poke gate and the decision
+                    // cap apply in the normal WaitingDecision handler
+                    j.NextEventTick = tick;
+                }
+            }
+        }
+    }
+
+    // spontaneous idle decision (JunimoHarvester.update, master game): a standing
+    // junimo (controller null, harvestTimer <= 0) rolls 0.2%/frame with 1/6 ->
+    // pathfindToNewCrop DIRECTLY (no 70% gate) = one attempt per ~3000 frames
+    private long SampleIdleRandom() {
+        var u = _rnd.NextDouble();
+        if (u <= 0.0) u = 1e-12;
+        return Math.Max(1, (long)(-Cfg.IDLE_RANDOM_MEAN_TICKS * Math.Log(u)));
+    }
+
+    // claims_v3: vanilla nearest-search, but the end check skips tiles claimed by
+    // another junimo. No work list, no scans — the claim table alone suffices.
+    private void DecideV3(Junimo j, long tick) {
+        var path = AStarNearest(j.Pos, Cfg.EXP_LIMIT_LEGACY, self: j);
+        if (path != null) {
+            ReleaseOwnClaim(j);
+            var end = path[^1];
+            _claims[end] = j;
+            _ownerClaim[j] = end;
+            StartWalk(j, path, tick);
+            return;
+        }
+
+        // nothing unclaimed within reach: 25% go home, else wander (like legacy's tail)
+        if (_rnd.NextDouble() < 0.25) {
+            _respawns++;
+            j.State = Junimo.St.WaitingRespawn;
+            j.NextEventTick = tick + Cfg.SPAWN_STAGGER_TICKS;
+        } else {
+            Wander(j, tick);
+        }
+    }
+
+    private void Wander(Junimo j, long tick) {
+        // PatchPathfindToRandomSpotAroundHut: each retry is a full-budget A*; BJ 3.2.0
+        // retried unreachable endpoints 6 times (retry <= 5), the shipped build caps
+        // it at 2 — the cap IS part of the patch being measured
+        var attempts = _algo is "legacy" or "legacy_arrival"
+            ? Cfg.WANDER_ATTEMPTS_LEGACY
+            : Cfg.WANDER_ATTEMPTS_PATCHED;
+        var hut = HutTile();
+        var hx = XOf(hut); var hy = YOf(hut);
+        for (var attempt = 0; attempt < attempts; attempt++) {
+            var rx = hx + _rnd.Next(-_radius, _radius + 1);
+            var ry = hy + _rnd.Next(-_radius, _radius + 1);
+            if (rx < 0 || ry < 0 || rx >= Cfg.W || ry >= Cfg.H) continue;
+            var p = AStarTo(j.Pos, Idx(rx, ry), Cfg.EXP_LIMIT_LEGACY);
+            if (p != null) { StartWalk(j, p, tick); return; }
+        }
+        j.State = Junimo.St.WaitingDecision;
+        j.NextEventTick = tick + Cfg.DECISION_RETRY_TICKS;
+    }
+
+    private void StartWalk(Junimo j, List<int> path, long tick) {
+        // j.Pos must be the junimo's CURRENT tile here. An empty path (target is the
+        // tile we're standing on) resolves instantly into a re-decision.
+        j.Path = path;
+        j.Origin = j.Pos;
+        j.WalkStartTick = tick;
+        j.TargetTile = path.Count > 0 ? path[^1] : j.Pos;
+        j.State = Junimo.St.Walking;
+        j.NextEventTick = tick + (j.Retargets ? Cfg.RETARGET_INTERVAL : path.Count * Cfg.TICKS_PER_TILE);
+    }
+
+    // vanilla re-plans mid-walk (~70%/frame in the real game; approximated at 10t
+    // intervals here): re-run the work search from the current tile and redirect.
+    // This is what makes vanilla junimos converge into trains, and it is the CPU
+    // storm that the decision rate cap removes.
+    private void Retarget(Junimo j, long tick, int fromTile) {
+        switch (_algo) {
+            case "legacy": {
+                var path = AStarNearest(fromTile, Cfg.EXP_LIMIT_LEGACY);
+                if (path != null) { StartWalk(j, path, tick); return; }
+
+                var roll = _rnd.NextDouble();
+                if (roll < 0.5 && _lkc >= 0 && _crops.Contains(_lkc)) {
+                    var p = AStarTo(fromTile, _lkc, Cfg.EXP_LIMIT_LEGACY);
+                    if (p != null) { StartWalk(j, p, tick); return; }
+                    // vanilla: the lkc controller replaces the walk even when its path is
+                    // null — the junimo stands and re-pokes, it does NOT re-roll home
+                    j.State = Junimo.St.WaitingDecision;
+                    j.NextEventTick = tick + Cfg.DECISION_RETRY_TICKS;
+                    return;
+                }
+                roll = _rnd.NextDouble();
+
+                if (roll < 0.25) {
+                    _respawns++;
+                    j.State = Junimo.St.WaitingRespawn;
+                    j.NextEventTick = tick + Cfg.SPAWN_STAGGER_TICKS;
+                } else {
+                    Wander(j, tick);
+                }
+                break;
+            }
+
+            case "claims_v4b": {
+                var path = AStarNearest(fromTile, Cfg.EXP_LIMIT_LEGACY, self: j);
+                if (path != null) {
+                    ReleaseOwnClaim(j);
+                    var end = path[^1];
+                    _claims[end] = j;
+                    _ownerClaim[j] = end;
+                    StartWalk(j, path, tick);
+                    return;
+                }
+
+                ReleaseOwnClaim(j);
+                var roll2 = _rnd.NextDouble();
+                if (roll2 < 0.5 && _lkc >= 0 && _crops.Contains(_lkc)) {
+                    var p2 = AStarTo(fromTile, _lkc, Cfg.EXP_LIMIT_LEGACY);
+                    if (p2 != null) { StartWalk(j, p2, tick); return; }
+                    j.State = Junimo.St.WaitingDecision;
+                    j.NextEventTick = tick + Cfg.DECISION_RETRY_TICKS;
+                    return;
+                }
+                roll2 = _rnd.NextDouble();
+
+                if (roll2 < 0.25) {
+                    _respawns++;
+                    j.State = Junimo.St.WaitingRespawn;
+                    j.NextEventTick = tick + Cfg.SPAWN_STAGGER_TICKS;
+                } else {
+                    Wander(j, tick);
+                }
+                break;
+            }
+        }
+    }
+}
